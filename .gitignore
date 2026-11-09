@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Packaging
+dist/
+build/
+*.egg-info/
+
+# Tests & Linters
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local Scratch & Diagnostics
+scratch/
+
+# Test audio outputs
+testdata/out/
+testdata/*_zout.wav
+testdata/*_noise_profile.wav
+
+# OS Files
+.DS_Store
+Thumbs.db
