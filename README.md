@@ -52,13 +52,18 @@ to see which are available.
 |---------|---------|---------|
 | NOISY mode (spectral denoising) | `noisereduce` | `pip install noisereduce` |
 | CLEAN mode (speaker extraction) | `voxlock` | `pip install voxlock` |
-| DeepFilterNet3 polish stage | `deepfilternet-slim` | see notes below |
+| DeepFilterNet3 polish stage | `deepfilter-stream` | `pip install deepfilter-stream` |
 
 **`noisereduce`** and **`voxlock`** are both on PyPI and install with pip.
 
-**`deepfilternet-slim`** is an optional C runtime for the DeepFilterNet3 speech-enhancement polish
-pass. If absent, the polish stage is silently skipped — NOISY and CLEAN processing still run
-normally, only the final polish step is omitted.
+**Polish stage** runs two backends in priority order:
+1. `deepfilternet-slim` — private C runtime (highest quality; see project docs for distribution)
+2. `deepfilter-stream` — public ONNX wheel (`pip install deepfilter-stream`), used automatically
+   when `deepfilternet-slim` is not installed
+
+If neither is installed the polish pass is silently skipped — NOISY and CLEAN still produce valid
+output, only the final speech-enhancement step is omitted. Run `zout --check-deps` to see which
+backend is active.
 
 ### FFmpeg
 

@@ -52,7 +52,8 @@ pytest tests/test_e2e.py -v
 | `silero_vad`      | Forensic audit VAD | ✅ OK    | `pip install silero-vad`               |
 | `sounddevice`     | Audio playback     | ✅ OK    | `pip install sounddevice`              |
 | `ffmpeg`+`ffprobe`| MP3/M4A/AAC        | ✅ OK    | system package                         |
-| `deepfilternet_slim` | Polish stage    | ❌ MISSING | see project docs (no public path)    |
+| `deepfilternet_slim` | Polish (C runtime) | ❌ MISSING | private; see project docs          |
+| `deepfilter_stream`  | Polish (ONNX fallback) | ✅ OK  | `pip install deepfilter-stream`    |
 
 Run `zout --check-deps` to get a live report at any time.
 
@@ -60,9 +61,9 @@ Run `zout --check-deps` to get a live report at any time.
 
 ## Known Limitations
 
-**`deepfilternet_slim`** — The polish stage is silently skipped (no test failures) because
-`DeepFilter` import errors are caught and ignored. DeepFilterNet3 output is not tested.
-Install guide not yet published by the maintainer.
+**`deepfilternet_slim`** — The private C runtime polish backend is not installed. The public
+`deepfilter-stream` ONNX fallback is active instead, so the polish stage runs normally.
+Install `deepfilternet-slim` to use the C runtime backend (see project docs).
 
 ---
 

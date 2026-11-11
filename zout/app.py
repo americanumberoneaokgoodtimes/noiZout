@@ -393,8 +393,17 @@ def _check_deps() -> int:
          "pip install noisereduce")
     _chk("CLEAN mode  (VoxLock speaker extraction)", "voxlock",
          "pip install voxlock")
-    _chk("Polish stage (DeepFilterNet3 C runtime)", "deepfilternet_slim",
-         "see project docs for deepfilternet-slim install")
+    # Polish stage: try slim C runtime first, then public ONNX wheel
+    try:
+        import deepfilternet_slim  # noqa: F401
+        console.print("  [green]  OK [/]  Polish stage (deepfilternet-slim C runtime)  [dim]private package[/]")
+    except ImportError:
+        console.print("  [yellow] SLIM [/]  Polish stage (deepfilternet-slim C runtime)  [dim]not installed — see project docs[/]")
+    try:
+        import deepfilter_stream  # noqa: F401
+        console.print("  [green]  OK [/]  Polish stage (deepfilter-stream ONNX — public)  [dim]active fallback[/]")
+    except ImportError:
+        console.print("  [red] MISSING [/]  Polish stage (deepfilter-stream ONNX — public)  [dim]pip install deepfilter-stream[/]")
 
     console.print("\n[bold cyan]Media format support[/]")
     ffmpeg_ok = shutil.which("ffmpeg") is not None
