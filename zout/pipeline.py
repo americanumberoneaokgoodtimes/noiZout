@@ -320,8 +320,10 @@ def run_job(
 
     out_path = Path(cfg.output or cfg.default_output())
 
+    # In-memory path stays <75MB up to ~480k samples (≈10s@48kHz, 5s@96kHz).
+    # Streaming path is always bounded by MAX_SAMPLES_PER_CHUNK (240k) regardless of duration.
     should_stream = (
-        eff_dur > 30.0
+        int(eff_dur * sr) > 480_000
         or cfg.chunk_duration != 60.0
         or cfg.overlap_duration != 2.0
     )

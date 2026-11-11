@@ -136,18 +136,19 @@ def compute_rms(
 def extract_vad_intervals(
     audio: np.ndarray | Path | str,
     sr: int | None = None,
-    threshold: float = 0.20,
+    threshold: float = 0.10,
     min_speech_sec: float = 0.03,
     min_silence_sec: float = 0.35,
     chunk_sec: float = 10.0,
 ) -> list[dict[str, float]]:
-    """Extract continuous speech intervals using pysilero_vad in streaming passes.
+    """Extract continuous speech intervals using silero_vad.
 
     Args:
         audio: Audio waveform as 1D/2D array or file Path.
         sr: Sample rate if audio is array.
-        threshold: Speech probability threshold (default 0.20 for reliable detection of speech harmonics
-                   while strictly rejecting Gaussian noise and acoustic hum).
+        threshold: Speech probability threshold (default 0.10; silero_vad discriminates
+                   speech harmonics from noise/hum at this level while keeping false
+                   positives near zero on broadband Gaussian noise).
         min_speech_sec: Minimum duration for a valid speech interval.
         min_silence_sec: Bridge silence gaps shorter than this duration.
         chunk_sec: Processing block size in seconds.
@@ -156,14 +157,17 @@ def extract_vad_intervals(
         List of dicts: [{"start": float, "end": float, "duration": float}]
     """
     try:
-        import pysilero_vad
-        detector = pysilero_vad.SileroVoiceActivityDetector()
+        import torch
+        import silero_vad as _svad
+        model = _svad.load_silero_vad()
     except Exception:
         return []
 
-    step = 512
-    frame_dur = step / 16000.0
-    active_frames: list[bool] = []
+    def _get_mono_16k(arr: np.ndarray, arr_sr: int) -> np.ndarray:
+        mono = arr if arr.ndim == 1 else arr.mean(axis=1)
+        if arr_sr != 16000:
+            mono = soxr.resample(mono, arr_sr, 16000, quality="HQ")
+        return mono.astype(np.float32)
 
     if isinstance(audio, (Path, str)):
         path = Path(audio)
@@ -172,88 +176,39 @@ def extract_vad_intervals(
         try:
             with sf.SoundFile(str(path)) as snd:
                 file_sr = snd.samplerate
-                chunk_frames = max(1024, int(chunk_sec * file_sr))
-                rem_16k = np.zeros(0, dtype=np.float32)
-                while True:
-                    chunk = snd.read(chunk_frames, dtype="float32", always_2d=True)
-                    if len(chunk) == 0:
-                        break
-                    mono = chunk.mean(axis=1)
-                    if file_sr != 16000:
-                        chunk_16k = soxr.resample(mono, file_sr, 16000, quality="HQ").astype(np.float32)
-                    else:
-                        chunk_16k = mono.astype(np.float32)
-                    buf = np.concatenate([rem_16k, chunk_16k])
-                    n_frames = len(buf) // step
-                    for i in range(n_frames):
-                        frame = buf[i * step : (i + 1) * step]
-                        pcm = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-                        prob = detector(pcm)
-                        active_frames.append(prob >= threshold)
-                    rem_16k = buf[n_frames * step :]
-                if len(rem_16k) > 0:
-                    frame = np.pad(rem_16k, (0, step - len(rem_16k)))
-                    pcm = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-                    prob = detector(pcm)
-                    active_frames.append(prob >= threshold)
+                data = snd.read(dtype="float32", always_2d=True)
+            mono_16k = _get_mono_16k(data, file_sr)
         except Exception:
             return []
     else:
-        if audio is None or audio.size == 0:
+        if audio is None or (isinstance(audio, np.ndarray) and audio.size == 0):
             return []
-        mono = audio if audio.ndim == 1 else audio.mean(axis=1)
         effective_sr = sr or 16000
-        if effective_sr != 16000:
-            mono_16k = soxr.resample(mono, effective_sr, 16000, quality="HQ").astype(np.float32)
-        else:
-            mono_16k = mono.astype(np.float32)
-        n_frames = len(mono_16k) // step
-        for i in range(n_frames):
-            frame = mono_16k[i * step : (i + 1) * step]
-            pcm = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-            prob = detector(pcm)
-            active_frames.append(prob >= threshold)
+        mono_16k = _get_mono_16k(audio, effective_sr)
 
-    if not active_frames or not any(active_frames):
+    if len(mono_16k) == 0:
         return []
 
-    # Segment active frames into contiguous intervals
-    raw_intervals: list[dict[str, float]] = []
-    in_speech = False
-    start_frame = 0
-    for idx, is_sp in enumerate(active_frames):
-        if is_sp and not in_speech:
-            in_speech = True
-            start_frame = idx
-        elif not is_sp and in_speech:
-            in_speech = False
-            raw_intervals.append({
-                "start": round(start_frame * frame_dur, 3),
-                "end": round(idx * frame_dur, 3),
-                "duration": round((idx - start_frame) * frame_dur, 3),
-            })
-    if in_speech:
-        raw_intervals.append({
-            "start": round(start_frame * frame_dur, 3),
-            "end": round(len(active_frames) * frame_dur, 3),
-            "duration": round((len(active_frames) - start_frame) * frame_dur, 3),
-        })
+    try:
+        audio_tensor = torch.from_numpy(mono_16k)
+        raw = _svad.get_speech_timestamps(
+            audio_tensor, model,
+            return_seconds=True,
+            threshold=threshold,
+            min_speech_duration_ms=int(min_speech_sec * 1000),
+            min_silence_duration_ms=int(min_silence_sec * 1000),
+        )
+    except Exception:
+        return []
 
-    # Bridge silence gaps
-    merged: list[dict[str, float]] = []
-    for item in raw_intervals:
-        if not merged:
-            merged.append(dict(item))
-        else:
-            prev = merged[-1]
-            if item["start"] - prev["end"] <= min_silence_sec:
-                prev["end"] = item["end"]
-                prev["duration"] = round(prev["end"] - prev["start"], 3)
-            else:
-                merged.append(dict(item))
-
-    # Enforce minimum speech duration
-    return [i for i in merged if i["duration"] >= min_speech_sec]
+    intervals = []
+    for seg in raw:
+        start = round(float(seg["start"]), 3)
+        end = round(float(seg["end"]), 3)
+        dur = round(end - start, 3)
+        if dur >= min_speech_sec:
+            intervals.append({"start": start, "end": end, "duration": dur})
+    return intervals
 
 
 def compute_speech_summary(vad_intervals: list[dict[str, float]], total_duration_sec: float) -> dict[str, float]:
@@ -399,8 +354,9 @@ def generate_audit_manifest(
     else:
         suppression_db = sanitize_float(suppression_db, default=0.0, ndigits=2)
 
-    # 6. Continuous VAD speech intervals (analyzed on output audio / clean signal)
-    vad_target = out_src if out_src is not None else in_src
+    # 6. Continuous VAD speech intervals (analyzed on input audio — documents what speech
+    #    was present in the original recording; falls back to output if input unavailable)
+    vad_target = in_src if in_src is not None else out_src
     vad_intervals = extract_vad_intervals(vad_target, sr=sr)
 
     # 7. Compute speech summary

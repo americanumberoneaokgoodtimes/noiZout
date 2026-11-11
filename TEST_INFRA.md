@@ -6,7 +6,7 @@ This document specifies the testing architecture, methodology, environment, and 
 
 The testing infrastructure guarantees:
 1. **Opaque-Box Requirement Coverage**: Tests exercise high-level application interfaces (`JobConfig`, `run_job`, `AudioPlayer`, CLI entry point `_cli`) and validate observable behaviors without depending on internal implementation details.
-2. **Speed & Determinism**: Uses fast, mathematically derived synthetic audio fixtures (sine waves, harmonic speech envelopes, acoustic hum, Gaussian noise) so the entire 93-test E2E suite executes in **< 10 seconds** without downloading remote models or accessing hardware sound cards.
+2. **Speed & Determinism**: Uses fast, mathematically derived synthetic audio fixtures (sine waves, harmonic speech envelopes, acoustic hum, Gaussian noise) without downloading remote models or accessing hardware sound cards. Full 125-test suite executes in ~2 minutes (KL-NMF is compute-intensive at 48kHz).
 3. **Headless & CI Resilience**: Provides a drop-in `MockOutputStream` for `sounddevice` to ensure playback and meter callback logic execute reliably on headless servers and CI nodes lacking physical DAC hardware.
 4. **Progressive Testability**: Employs dynamic interface discovery guards (`is_r1_implemented()`, `is_r2_implemented()`, etc.) allowing tests to run cleanly during active milestone development, automatically activating as each milestone lands.
 
@@ -36,21 +36,21 @@ C:\Users\o\Desktop\git\zout\
 ## 3. Environment & Execution Protocol
 
 ### 3.1 Python Virtual Environment
-- **Python Version**: 3.11.9
-- **Virtual Environment Path**: `C:\Users\o\Desktop\git\zout\.venv`
-- **Key Test Libraries**: `pytest` (>=9.2.0), `soundfile`, `soxr`, `numpy`, `rich`, `pysilero_vad`, `noisereduce`
+- **Python Version**: 3.10+
+- **Key Test Libraries**: `pytest`, `soundfile`, `soxr`, `numpy`, `rich`, `silero-vad`, `noisereduce`
+- **Optional (required for CLEAN mode tests)**: `voxlock` (no public install path — see project docs)
 
 ### 3.2 Primary Test Execution Commands
 
-```powershell
-# Run the complete E2E test suite (Tiers 1 through 4)
-.\.venv\Scripts\pytest.exe tests/test_e2e.py -v
+```bash
+# Run unit tests + E2E suite (recommended)
+pytest tests/test_zout.py tests/test_e2e.py -v
 
-# Run existing unit regression tests
-.\.venv\Scripts\pytest.exe tests/test_zout.py -v
+# Run only the E2E suite
+pytest tests/test_e2e.py -v
 
-# Run the entire test repository
-.\.venv\Scripts\pytest.exe tests/ -v
+# Check which runtime dependencies are available
+zout --check-deps
 ```
 
 ---

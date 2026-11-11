@@ -25,7 +25,7 @@ noiZout (`zout`) is a terminal-based audio differentiation engine built with Pyt
 
 ### Requirements
 - Python 3.10+
-- FFmpeg (recommended for reading compressed audio formats like `.mp3`, `.m4a`, etc.)
+- FFmpeg (required for MP3/M4A/AAC input)
 
 ```bash
 # Clone the repository
@@ -39,9 +39,40 @@ python -m venv .venv
 # Linux/macOS:
 source .venv/bin/activate
 
-# Install dependencies
+# Install core dependencies
 pip install -e .
 ```
+
+### Runtime Feature Dependencies
+
+Three optional packages unlock additional processing modes. Run `zout --check-deps` at any time
+to see which are available.
+
+| Feature | Package | Install |
+|---------|---------|---------|
+| NOISY mode (spectral denoising) | `noisereduce` | `pip install noisereduce` |
+| CLEAN mode (speaker extraction) | `voxlock` | see notes below |
+| DeepFilterNet3 polish stage | `deepfilternet-slim` | see notes below |
+
+**`noisereduce`** is available on PyPI and is the most commonly used mode.
+
+**`voxlock`** is a proprietary Target-Speaker Extraction runtime. Contact the project maintainer
+for distribution. Without it, all CLEAN mode operations raise an `ImportError` with a clear message.
+
+**`deepfilternet-slim`** is an optional C runtime for the DeepFilterNet3 speech-enhancement polish
+pass. If absent, the polish stage is silently skipped — NOISY and CLEAN processing still run
+normally, only the final polish step is omitted.
+
+### FFmpeg
+
+FFmpeg is required for reading compressed audio formats (MP3, M4A, AAC, OGG Vorbis, etc.).
+WAV and FLAC work without FFmpeg.
+
+- **Windows**: `winget install ffmpeg` or download from https://ffmpeg.org/download.html
+- **macOS**: `brew install ffmpeg`
+- **Linux**: `apt install ffmpeg` / `dnf install ffmpeg`
+
+Verify installation: `zout --check-deps`
 
 ---
 
@@ -58,15 +89,20 @@ zout
 | Key | Action |
 | :--- | :--- |
 | `[1]` | Select Reference Audio File (File Picker) |
-| `[T]` | Toggle Reference Role (`NOISY` / `CLEAN`) |
+| `[M]` | Toggle Reference Role (`NOISY` ↔ `CLEAN`) |
 | `[2]` | Select Main Audio Recording (File Picker) |
-| `[A]` | Auto-extract room noise profile from main recording |
+| `[B]` | Select Batch Directory (process a whole folder) |
+| `[N]` | Auto-extract room noise profile from main recording |
+| `[T]` | Set timeline range (`--start` / `--end`) |
 | `[3]` / `[4]` | Adjust Strength & Max Attenuation Cap |
 | `[F]` | Toggle DeepFilterNet3 Polish (`ON` / `OFF`) |
+| `[A]` | Toggle Forensic Audit sidecar (`.json` manifest) |
 | `[O]` | Set custom output path |
 | `[P]` | Play reference noise / Processed output |
 | `[p]` | Play main subject recording |
 | `[Space]` | Stop playback |
+| `[Tab]` | A/B hot-swap during result playback |
+| `[C]` | Cycle color theme |
 | `[R]` | Run processing pipeline |
 | `[Q]` | Quit |
 
@@ -89,23 +125,126 @@ zout -m recording.wav --auto-noise --noise-chunks 6 --noise-len 2.0 -s 0.85
 zout -r clean_voice_sample.wav -m noisy_meeting.wav -t clean -s 0.85 -a 30 -o isolated_voice.wav
 ```
 
+#### Timeline Range Slicing
+```bash
+# Process only the segment from 0:30 to 2:00
+zout -r noise.wav -m speech.wav -t noisy --start 00:30 --end 02:00
+
+# Accepts seconds (30.5), mm:ss (00:30), or hh:mm:ss (01:30:00)
+```
+
+#### Forensic Audit Sidecar
+```bash
+# Generate a JSON audit manifest alongside the output
+zout -r noise.wav -m recording.wav -t noisy --audit -o cleaned.wav
+# Writes cleaned_audit.json with true-peak, RMS, VAD timestamps, parameters
+```
+
+#### Batch Processing
+```bash
+# Process every audio file in a directory
+zout -r noise_profile.wav --batch ./raw_recordings/ --out-dir ./processed/ --role noisy
+
+# Output files are named <original_name>_zout.wav
+```
+
+#### Dependency Check
+```bash
+# See which optional features are available
+zout --check-deps
+```
+
 #### CLI Flags
-- `-r, --ref FILE`: Reference audio sample (noise profile or clean voice).
-- `-m, --main FILE`: Main recording to differentiate.
-- `-t, --role [noisy|clean]`: Classify reference as `noisy` (remove it) or `clean` (keep it).
-- `-s, --strength FLOAT`: Inference strength / adaptive threshold (0.0 to 1.0, default 0.75).
-- `-a, --atten-db DB`: Max attenuation cap in dB (6 to 60 dB, $\ge 60$ uncapped, default 24).
-- `--auto-noise`: Automatically scan main recording for speech-free room noise chunks.
-- `--noise-chunks N`: Number of noise sections to find (default 6).
-- `--noise-len SEC`: Duration of each section in seconds (default 2.0).
-- `--noise-mode [balanced|deep|fast]`: Extraction sensitivity strategy.
-- `--save-noise FILE`: Save extracted noise profile to disk.
-- `-o, --out FILE`: Output audio file path (defaults to `<main>_zout.wav`).
-- `-q, --quiet`: Quiet execution (suppress progress bar; prints only output path).
+
+| Flag | Description |
+|------|-------------|
+| `-r, --ref FILE` | Reference audio (noise profile or clean voice) |
+| `-m, --main FILE` | Main recording to process |
+| `-t, --role [noisy\|clean]` | `noisy` = remove it; `clean` = keep it |
+| `-s, --strength 0-1` | Processing strength (default 0.75) |
+| `-a, --atten-db DB` | Max attenuation cap in dB (default 24; ≥60 = uncapped) |
+| `--polish [auto\|on\|off]` | DeepFilterNet3 speech polish (requires deepfilternet-slim) |
+| `-o, --out FILE` | Output path (default: `<main>_zout.wav`) |
+| `-q, --quiet` | No progress bar; prints only the output path |
+| `--start TIME` | Start offset: seconds, `mm:ss`, or `hh:mm:ss` |
+| `--end TIME` | End offset: seconds, `mm:ss`, or `hh:mm:ss` |
+| `--audit` | Generate forensic JSON audit manifest sidecar |
+| `-b, --batch DIR` | Process entire directory of audio files |
+| `--out-dir DIR` | Output directory for batch results (default: `<batch>/processed/`) |
+| `--auto-noise` | Scan `--main` for speech-free noise sections and use as reference |
+| `--noise-chunks N` | Number of noise sections to extract (default 6) |
+| `--noise-len SEC` | Duration of each noise section (default 2.0s) |
+| `--noise-mode` | `balanced` / `deep` / `fast` extraction strategy |
+| `--save-noise FILE` | Save extracted noise profile to disk |
+| `--check-deps` | Report which runtime features are available and exit |
 
 ---
 
-## Architecture
+## CLEAN Mode — Speaker Extraction Guide
+
+CLEAN mode uses VoxLock Target-Speaker Extraction (TSE) to isolate one specific voice from a
+multi-speaker recording. It requires the `voxlock` package.
+
+### How It Works
+
+1. **Enrollment**: A short reference clip of the target speaker's voice is processed to build
+   a speaker embedding (voice fingerprint).
+2. **Extraction**: The main recording is scanned and only audio that matches the speaker
+   fingerprint is preserved. All other voices, background noise, and room reflections are
+   suppressed.
+3. **Fullband Restoration**: VoxLock operates in the 0–8 kHz band. Frequencies above 8 kHz
+   are retained from the original and gated by the speech-presence ratio in the extracted band,
+   preserving natural air and sibilance.
+
+### Reference Clip Requirements
+
+| Requirement | Minimum | Recommended |
+|-------------|---------|-------------|
+| Duration | 1 second | 3–10 seconds |
+| Voiced speech | 0.5 seconds | ≥ 2 seconds |
+| Environment | Any | Quiet room, same mic as main recording |
+| Format | Any supported audio | WAV/FLAC 16kHz–48kHz |
+
+**Tips for best results:**
+- The reference clip should contain only the target speaker — no background music, no other voices.
+- Longer references with varied pitch and rhythm improve speaker fingerprint accuracy.
+- If `zout` warns `"only X.XXs of voice found in reference"`, the clip has too much silence or
+  noise. Trim to the voiced section.
+- The same microphone and room as the main recording generally gives better results, but is
+  not required.
+
+### Example
+
+```bash
+# Conference call: isolate Alice's voice (you have a clean clip of Alice speaking)
+zout -r alice_reference.wav -m full_meeting.wav -t clean -s 0.80 -a 30 -o alice_only.wav
+
+# Short enrollment clip is fine — 3 seconds of clear speech is enough
+zout -r alice_3sec.wav -m two_hour_recording.wav -t clean -s 0.75 -o alice_isolated.wav
+```
+
+### Strength and Attenuation Settings
+
+| Setting | Recommended range | Effect |
+|---------|------------------|--------|
+| `--strength` | 0.65–0.85 | Higher = more aggressive speaker separation; may cut quiet speech |
+| `--atten-db` | 24–40 dB | How much to attenuate rejected content; 24 dB is a natural-sounding floor |
+
+---
+
+## Testing
+
+```bash
+# Run the full test suite (requires noisereduce)
+pytest tests/test_zout.py tests/test_e2e.py -v
+
+# Check which features are available before running
+zout --check-deps
+```
+
+Current test status: **120/125 passing** (5 blocked by voxlock dependency).
+
+---
 
 ```text
                   +-------------------------------+
@@ -131,16 +270,6 @@ zout -r clean_voice_sample.wav -m noisy_meeting.wav -t clean -s 0.85 -a 30 -o is
                        EBU R128 Peak Limiting
                                   |
                         Clean Output Audio
-```
-
----
-
-## Testing
-
-Run the test suite with pytest:
-
-```bash
-pytest -v
 ```
 
 ---
