@@ -22,6 +22,11 @@ class NoiseExtractionResult:
     output_path: Path | None = None
     warnings: list[str] = field(default_factory=list)
 
+    @property
+    def waveform_envelope(self) -> str:
+        from .io import compute_waveform_envelope
+        return compute_waveform_envelope(self.audio, width=16)
+
     def summary(self) -> str:
         dur = len(self.audio) / self.sr
         chunk_strs = [f"{s:.1f}s-{e:.1f}s" for s, e in self.chunks]
@@ -30,7 +35,8 @@ class NoiseExtractionResult:
             chunks_display += f" ... (+{len(chunk_strs) - 4} more)"
         return (
             f"Extracted {len(self.chunks)} noise sections ({dur:.1f}s total) | "
-            f"Noise floor: {self.rms_db:.1f} dBFS\n"
+            f"Noise floor: {self.rms_db:.1f} dBFS | "
+            f"Waveform: [{self.waveform_envelope}]\n"
             f"Timeline chunks: [{chunks_display}]"
         )
 

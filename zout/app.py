@@ -13,7 +13,7 @@ from .config import SUPPORTED_AUDIO_EXTENSIONS, JobConfig, ReferenceRole
 def _cli(args) -> int:
     from rich.progress import Progress
 
-    from .audio.io import load_audio, save_audio
+    from .audio.io import load_audio, parse_time_spec, save_audio
     from .audio.noise_extractor import extract_noise_profile
     from .pipeline import run_job
 
@@ -21,9 +21,11 @@ def _cli(args) -> int:
 
     ref_path = Path(args.ref) if args.ref else None
     role = ReferenceRole(args.role.upper()) if args.role else ReferenceRole.NOISY
-    main_path = Path(args.main)
+    main_path = Path(args.main) if args.main else None
+    batch_dir = Path(args.batch) if getattr(args, "batch", None) else None
+    out_dir = Path(args.out_dir) if getattr(args, "out_dir", None) else None
 
-    if args.auto_noise:
+    if args.auto_noise and main_path:
         if not args.quiet:
             console.print(f"[cyan]Auto-extracting noise profile from:[/] {main_path.name}")
         main_audio, sr = load_audio(main_path, mono=True)
@@ -44,68 +46,130 @@ def _cli(args) -> int:
                 for w in noise_res.warnings:
                     console.print(f"[yellow]Notice:[/] {w}")
 
-    cfg = JobConfig(ref_path, role, main_path, args.strength,
-                    args.atten_db, Path(args.out) if args.out else None,
-                    None if args.polish == "auto" else args.polish == "on")
+    start_sec = parse_time_spec(args.start) if getattr(args, "start", None) else None
+    end_sec = parse_time_spec(args.end) if getattr(args, "end", None) else None
+    audit = getattr(args, "audit", False)
+
+    cfg = JobConfig(
+        reference=ref_path,
+        role=role,
+        main=main_path,
+        strength=args.strength,
+        max_atten_db=args.atten_db,
+        output=Path(args.out) if args.out else None,
+        polish=None if args.polish == "auto" else args.polish == "on",
+        start_sec=start_sec,
+        end_sec=end_sec,
+        audit=audit,
+        batch_dir=batch_dir,
+        out_dir=out_dir,
+    )
+
     if args.quiet:
         res = run_job(cfg)
-        print(res.output)
-        return 0
+        if res is not None:
+            print(res.output)
+            return 0
+        return 1
+
     with Progress(console=console) as pg:
         task = pg.add_task("zout", total=100)
         res = run_job(cfg, lambda m, f: pg.update(task, completed=f * 100, description=m))
-    console.print(f"[green]Wrote[/] {res.output}  ({res.seconds:.1f}s, noise floor -{res.suppression_db:.1f} dB)")
+
+    if res is None:
+        console.print("[bold yellow]Job cancelled.[/bold yellow]")
+        return 1
+
+    if getattr(res, "notes", {}).get("batch"):
+        success = res.notes.get("success", 0)
+        total = res.notes.get("total", 0)
+        failures = res.notes.get("failures", [])
+        console.print(f"[green]Batch processing complete:[/] {success}/{total} files processed into {res.output}")
+        for f in failures:
+            console.print(f"[yellow]  failed:[/] {f}")
+    else:
+        console.print(f"[green]Wrote[/] {res.output}  ({res.seconds:.1f}s, noise floor -{res.suppression_db:.1f} dB)")
     if res.notes.get("warning"):
         console.print(f"[yellow]warning:[/] {res.notes['warning']}")
+    if res.audit_path and res.audit_path.is_file():
+        console.print(f"[cyan]Forensic audit manifest saved:[/] {res.audit_path}")
     return 0
 
 
 def _interactive() -> int:
+    import shutil
+
+    from rich.live import Live
+
     from .audio.player import player
-    from .tui import file_picker, screens
+    from .tui import file_picker, screens, themes
 
     console = Console()
     cfg = JobConfig()
-    msg = ""
+    # Preflight: warn if ffmpeg is missing (needed for MP3/M4A/AAC)
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        msg = "ffmpeg not found — MP3/M4A/AAC files will fail to load. Run 'zout --check-deps' for details."
+    else:
+        msg = ""
     last_dir: Path | None = None
     try:
         while True:
+            cur_th = themes.get_theme()
             console.clear()
-            console.print(screens.dashboard(cfg, msg))
+            console.print(screens.dashboard(cfg, msg, theme=cur_th))
             msg = ""
             k = screens.read_key()
-            if k.name != "char":
+            if k is None or k.name != "char":
                 continue
             c = k.char
             if c.lower() == "q":
                 return 0
             elif c == "1":
                 player.stop()
-                p = file_picker.pick_file(console, "Select REFERENCE audio file", last_dir)
+                p = file_picker.pick_file(console, "Select REFERENCE audio file", last_dir, theme=cur_th)
                 if p:
                     last_dir = p.parent
                     cfg.reference = p
-                    screens.prompt_role(console, cfg)
-            elif c.lower() == "t":
+                    screens.prompt_role(console, cfg, theme=cur_th)
+            elif c.lower() == "m":
                 cfg.role = ReferenceRole.CLEAN if cfg.role is ReferenceRole.NOISY else ReferenceRole.NOISY
             elif c == "2":
                 player.stop()
-                p = file_picker.pick_file(console, "Select MAIN recording", last_dir)
+                p = file_picker.pick_file(console, "Select MAIN recording", last_dir, theme=cur_th)
                 if p:
                     last_dir = p.parent
                     cfg.main = p
+                    cfg.batch_dir = None
                     cfg.output = None
-                    screens.prompt_params(console, cfg)
+                    screens.prompt_params(console, cfg, theme=cur_th)
+            elif c.lower() == "t":
+                player.stop()
+                screens.prompt_timeline_range(console, cfg, theme=cur_th)
             elif c.lower() == "a":
+                cfg.audit = not cfg.audit
+                msg = f"Forensic audit log {'ENABLED (.json manifest)' if cfg.audit else 'DISABLED'}"
+            elif c.lower() == "b":
+                player.stop()
+                d = file_picker.pick_directory(console, "Select BATCH directory of audio files", last_dir, theme=cur_th)
+                if d:
+                    last_dir = d
+                    cfg.batch_dir = d
+                    cfg.main = None
+                    cfg.output = None
+                    msg = f"Batch directory selected: {d.name}"
+            elif c.lower() == "c":
+                new_theme = themes.cycle_theme()
+                msg = f"Theme switched to: {new_theme.name}"
+            elif c.lower() == "n":
                 player.stop()
                 if not cfg.main or not cfg.main.is_file():
                     msg = "Pick main recording [2] first before auto-extracting noise."
                 else:
-                    out = screens.prompt_auto_noise(console, cfg)
+                    out = screens.prompt_auto_noise(console, cfg, theme=cur_th)
                     if out:
                         msg = f"Auto-extracted noise profile loaded from {out.name}"
             elif c in "34":
-                screens.prompt_params(console, cfg)
+                screens.prompt_params(console, cfg, theme=cur_th)
             elif c.lower() == "f":
                 cfg.polish = not cfg.use_polish()
             elif c == "P":  # Shift+P / Capital P: Play noise reference
@@ -117,7 +181,7 @@ def _interactive() -> int:
                         player.play(cfg.reference, "Noise Reference")
                         msg = f"▶ Playing noise reference: {cfg.reference.name}"
                 else:
-                    msg = "No reference noise audio available yet. Pick one [1] or auto-extract [A]."
+                    msg = "No reference noise audio available yet. Pick one [1] or auto-extract [N]."
             elif c == "p":  # Lowercase p: Play main subject audio
                 if cfg.main and cfg.main.is_file():
                     if player.is_playing() and player._target_name == "Main Recording":
@@ -132,7 +196,7 @@ def _interactive() -> int:
                 if player.is_playing():
                     player.stop()
                     msg = "Playback stopped."
-            elif c.lower() == "o" and cfg.main:
+            elif c.lower() == "o":
                 player.stop()
                 console.print("\nOutput path (blank = default): ", end="")
                 s = input().strip().strip('"')
@@ -140,35 +204,53 @@ def _interactive() -> int:
             elif c.lower() == "r":
                 player.stop()
                 if not cfg.ready():
-                    msg = "Select both a reference (or Auto-extract A) and a main recording first."
+                    msg = "Select both a reference (or Auto-extract N) and a main recording (2) or batch directory (B) first."
                     continue
                 console.clear()
-                res = screens.run_with_progress(console, cfg)
-                if isinstance(res, screens.Result):
-                    while True:
-                        console.clear()
-                        console.print(screens.result_card(res, player.status_text()))
-                        rk = screens.read_key()
-                        if rk.name == "char" and rk.char.upper() == "P":
-                            if player.is_playing() and player._target_name == "Processed Output":
-                                player.stop()
-                            else:
-                                player.play(res.output, "Processed Output")
-                        elif rk.name == "char" and rk.char.lower() == "p":
-                            if player.is_playing() and player._target_name == "Main Recording":
-                                player.stop()
-                            else:
-                                player.play(cfg.main, "Main Recording")
-                        elif rk.name == "char" and rk.char in (" ", "s", "S"):
-                            player.stop()
-                        elif rk.name in ("enter", "esc"):
-                            player.stop()
-                            break
-                else:
+                res = screens.run_with_progress(console, cfg, theme=cur_th)
+                if res is None:
+                    # Clean return upon [Esc] cancellation without crashing
+                    msg = "[bold yellow]Job cancelled by user.[/bold yellow]"
+                    continue
+                elif isinstance(res, Exception):
                     console.clear()
-                    console.print(screens.result_card(res))
-                    while screens.read_key().name != "enter":
-                        pass
+                    console.print(screens.result_card(res, theme=cur_th))
+                    while True:
+                        rk = screens.read_key()
+                        if rk and rk.name in ("enter", "esc"):
+                            break
+                    continue
+                else:
+                    # Auto-start A/B hot-swap playback with processed track B
+                    if cfg.main and res.output and res.output.is_file():
+                        player.play_pair(cfg.main, res.output, start_with="B")
+
+                    with Live(screens.result_card(res, player.status_text(), theme=cur_th),
+                              console=console, refresh_per_second=15) as live:
+                        while True:
+                            active_th = themes.get_theme()
+                            live.update(screens.result_card(res, player.status_text(), theme=active_th))
+                            rk = screens.poll_key(timeout=0.08)
+                            if rk is None:
+                                continue
+                            if rk.name == "tab":
+                                player.toggle_ab()
+                            elif rk.name == "space" or (rk.name == "char" and rk.char == " "):
+                                if player.is_playing():
+                                    player.stop()
+                                else:
+                                    if cfg.main and res.output and res.output.is_file():
+                                        player.play_pair(cfg.main, res.output, start_with="B")
+                            elif rk.name == "char" and rk.char.upper() == "P":
+                                player.play(res.output, "Processed Output")
+                            elif rk.name == "char" and rk.char == "p":
+                                if cfg.main and cfg.main.is_file():
+                                    player.play(cfg.main, "Main Recording")
+                            elif rk.name == "char" and rk.char.lower() == "c":
+                                themes.cycle_theme()
+                            elif rk.name in ("enter", "esc"):
+                                player.stop()
+                                break
     finally:
         player.stop()
 
@@ -181,6 +263,8 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="examples:\n"
                "  zout -r room_noise.wav -m interview.mp3 -t noisy -s 0.8\n"
                "  zout -m long_interview.wav --auto-noise -s 0.85\n"
+               "  zout -r noise.wav -m speech.wav -t noisy --start 00:30 --end 02:00 --audit\n"
+               "  zout -r noise.wav --batch ./raw_recordings/ --out-dir ./processed/\n"
                "  zout -r my_voice.wav -m meeting.wav -t clean --atten-db 40 -o out.wav",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-r", "--ref", metavar="FILE", help="reference sample (training file)")
@@ -196,6 +280,26 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("-o", "--out", metavar="FILE", help="output file (default: <main>_zout.wav)")
     ap.add_argument("-q", "--quiet", action="store_true", help="no progress bar; print only the output path")
     ap.add_argument("-V", "--version", action="version", version=f"zout {__version__}")
+    ap.add_argument("--check-deps", action="store_true",
+                    help="report which optional runtime features are available and exit")
+
+    # Timeline range slicing options (R5)
+    ts_group = ap.add_argument_group("timeline range slicing options")
+    ts_group.add_argument("--start", metavar="TIME", dest="start",
+                          help="start offset in seconds or mm:ss / hh:mm:ss")
+    ts_group.add_argument("--end", metavar="TIME", dest="end",
+                          help="end offset in seconds or mm:ss / hh:mm:ss")
+
+    # Forensic audit sidecar (R6)
+    ap.add_argument("--audit", "--json", action="store_true", dest="audit",
+                    help="generate forensic JSON audit manifest sidecar alongside output audio")
+
+    # Batch folder processing options (R8)
+    batch_group = ap.add_argument_group("batch folder processing options")
+    batch_group.add_argument("-b", "--batch", metavar="DIR", dest="batch",
+                             help="process an entire directory of audio files against reference profile")
+    batch_group.add_argument("--out-dir", metavar="DIR", dest="out_dir",
+                             help="destination directory for processed files (default: <batch>/processed/)")
 
     # Auto-noise extraction options
     ag = ap.add_argument_group("auto-noise extraction options")
@@ -213,40 +317,126 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _validate(ap: argparse.ArgumentParser, args) -> None:
+    from .audio.io import parse_time_spec
+
     if args.auto_noise and not args.main:
         ap.error("--auto-noise requires --main <FILE>")
 
+    if getattr(args, "batch", None):
+        if args.main:
+            ap.error("--batch and --main are mutually exclusive")
+        bp = Path(args.batch)
+        if not bp.exists():
+            ap.error(f"--batch: directory not found: {args.batch}")
+        if not bp.is_dir():
+            ap.error(f"--batch: must be a directory: {args.batch}")
+        if not args.ref:
+            ap.error("--batch requires --ref <FILE> and --role <noisy|clean>")
+
     for flag in ("ref", "main"):
-        p = getattr(args, flag)
+        p = getattr(args, flag, None)
         if p and not Path(p).is_file():
             ap.error(f"--{flag}: file not found: {p}")
         if p and Path(p).suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
             ap.error(f"--{flag}: unsupported audio type '{Path(p).suffix}' "
                      f"(supported: {' '.join(sorted(SUPPORTED_AUDIO_EXTENSIONS))})")
+
+    if getattr(args, "start", None) is not None:
+        try:
+            s = parse_time_spec(args.start)
+            if s is not None and s < 0:
+                ap.error("--start cannot be negative")
+        except Exception as ex:
+            ap.error(f"invalid --start value '{args.start}': {ex}")
+
+    if getattr(args, "end", None) is not None:
+        try:
+            e = parse_time_spec(args.end)
+            if e is not None and e <= 0:
+                ap.error("--end must be positive")
+        except Exception as ex:
+            ap.error(f"invalid --end value '{args.end}': {ex}")
+
+    if getattr(args, "start", None) is not None and getattr(args, "end", None) is not None:
+        try:
+            s = parse_time_spec(args.start)
+            e = parse_time_spec(args.end)
+            if s is not None and e is not None and s >= e:
+                ap.error(f"--start ({s}s) must be strictly less than --end ({e}s)")
+        except Exception:
+            pass
+
     if not 0.0 <= args.strength <= 1.0:
         ap.error("--strength must be between 0 and 1")
     if not 6.0 <= args.atten_db:
         ap.error("--atten-db must be >= 6")
 
 
+def _check_deps() -> int:
+    """Print a feature-availability table and exit."""
+    import shutil
+
+    console = Console()
+
+    def _chk(label: str, pkg: str, extra: str = "") -> None:
+        try:
+            __import__(pkg)
+            status = "[green]  OK [/]"
+        except ImportError:
+            status = "[red] MISSING [/]"
+        hint = f"  [dim]{extra}[/]" if extra else ""
+        console.print(f"  {status}  {label}{hint}")
+
+    console.print("[bold]noiZout runtime dependency check[/]\n")
+    console.print("[bold cyan]Audio processing[/]")
+    _chk("NOISY mode  (noisereduce spectral gating)", "noisereduce",
+         "pip install noisereduce")
+    _chk("CLEAN mode  (VoxLock speaker extraction)", "voxlock",
+         "see project docs for voxlock install")
+    _chk("Polish stage (DeepFilterNet3 C runtime)", "deepfilternet_slim",
+         "see project docs for deepfilternet-slim install")
+
+    console.print("\n[bold cyan]Media format support[/]")
+    ffmpeg_ok = shutil.which("ffmpeg") is not None
+    ffprobe_ok = shutil.which("ffprobe") is not None
+    if ffmpeg_ok and ffprobe_ok:
+        console.print("  [green]  OK [/]  ffmpeg + ffprobe  [dim](MP3, M4A, AAC, etc.)[/]")
+    else:
+        missing = " + ".join(x for x, ok in [("ffmpeg", ffmpeg_ok), ("ffprobe", ffprobe_ok)] if not ok)
+        console.print(f"  [red] MISSING [/]  {missing}  [dim](MP3/M4A/AAC will fail to load — install ffmpeg)[/]")
+
+    console.print("\n[bold cyan]Playback[/]")
+    _chk("sounddevice (audio output)", "sounddevice", "pip install sounddevice")
+    console.print()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = _build_parser()
     args = ap.parse_args(argv)
 
+    if getattr(args, "check_deps", False):
+        return _check_deps()
+
+    if getattr(args, "batch", None):
+        if not args.ref or not args.role:
+            ap.error("--batch requires --ref and --role")
+        _validate(ap, args)
+        return _cli(args)
+
     if args.auto_noise and args.main:
-        # Auto-noise specifies noise extraction from main
         _validate(ap, args)
         return _cli(args)
 
     given = [args.ref, args.main, args.role]
     if any(given) and not all(given):
-        ap.error("--ref, --main and --role must be given together (or use --auto-noise with --main)")
+        ap.error("--ref, --main and --role must be given together (or use --auto-noise with --main, or --batch with --ref and --role)")
     _validate(ap, args)
     try:
         if all(given):
             return _cli(args)
         if not sys.stdin.isatty():
-            ap.error("non-interactive use requires --ref, --main and --role (or --auto-noise with --main)")
+            ap.error("non-interactive use requires --ref, --main and --role (or --auto-noise with --main, or --batch with --ref and --role)")
         return _interactive()
     except KeyboardInterrupt:
         return 130

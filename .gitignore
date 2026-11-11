@@ -22,6 +22,19 @@ htmlcov/
 
 # Local Scratch & Diagnostics
 scratch/
+*.txtui
+.agents/
+
+# Large audio & scratch media
+*.mp3
+
+# Temporary and scratch audio files in repo root
+/*.wav
+/*.tmp
+*.tmp
+
+# Forensic Audit Sidecars
+*_audit.json
 
 # Test audio outputs
 testdata/out/

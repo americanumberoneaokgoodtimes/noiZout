@@ -12,8 +12,9 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from ..audio.io import probe_audio
+from ..audio.io import get_file_waveform_envelope, probe_audio
 from ..config import SUPPORTED_AUDIO_EXTENSIONS
+from . import themes
 from .keys import read_key
 
 
@@ -27,7 +28,8 @@ class Entry:
 class PickerState:
     """Filesystem navigation logic: lists only directories and supported audio files."""
 
-    def __init__(self, start: Path | None = None):
+    def __init__(self, start: Path | None = None, dirs_only: bool = False):
+        self.dirs_only = dirs_only
         self.cwd = self._valid(start)
         self.filter = ""
         self.index = 0
@@ -60,7 +62,7 @@ class PickerState:
                         try:
                             if e.is_dir():
                                 dirs.append(Entry(Path(e.path), True, e.name + os.sep))
-                            elif Path(e.name).suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
+                            elif not self.dirs_only and Path(e.name).suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
                                 files.append(Entry(Path(e.path), False, e.name))
                         except OSError:
                             continue
@@ -110,21 +112,22 @@ class PickerState:
             self.refresh()
 
 
-def render(state: PickerState, title: str, typing_filter: bool, height: int) -> Panel:
-    t = Table(box=box.SIMPLE_HEAD, expand=True, header_style="bold bright_cyan", pad_edge=False)
+def render(state: PickerState, title: str, typing_filter: bool, height: int, theme: themes.Theme | None = None) -> Panel:
+    th = theme or themes.get_theme()
+    t = Table(box=box.SIMPLE_HEAD, expand=True, header_style=f"bold {th.primary}", pad_edge=False)
     t.add_column("Type", width=7)
     t.add_column("Name", ratio=3, overflow="ellipsis", no_wrap=True)
-    t.add_column("Info", ratio=2, no_wrap=True)
-    rows = max(5, height - 10)
+    t.add_column("Info", ratio=3, no_wrap=True)
+    rows = max(5, height - 12)
     start = max(0, min(state.index - rows // 2, len(state.entries) - rows))
     for i in range(start, min(len(state.entries), start + rows)):
         e = state.entries[i]
         sel = i == state.index
         if e.is_dir:
-            typ, style, info = "[DIR]", "bold bright_blue", ""
+            typ, style, info = "[DIR]", f"bold {th.primary}", ""
         else:
             ext = e.path.suffix.lower().lstrip(".").upper()
-            typ, style = f"[{ext}]", "bright_green"
+            typ, style = f"[{ext}]", f"bold {th.accent}"
             ai = probe_audio(e.path) if sel else None
             try:
                 size = e.path.stat().st_size / 1024
@@ -133,31 +136,68 @@ def render(state: PickerState, title: str, typing_filter: bool, height: int) -> 
                 info = ""
             if ai:
                 info += f" | {ai.short()}"
+            if sel:
+                try:
+                    env = get_file_waveform_envelope(e.path, width=12)
+                    if env:
+                        info += f" | {env}"
+                except Exception:
+                    pass
         mark = Text("> " if sel else "  ", style="bold yellow")
         name = Text.assemble(mark, (e.label, style))
         row_style = "reverse" if sel else ""
         t.add_row(typ, name, info, style=row_style)
     if not state.entries:
-        t.add_row("", Text("(no folders or audio files here)", style="dim italic"), "")
-    path_line = Text.assemble(("Path: ", "bold"), (str("Drives" if state.at_drives else state.cwd), "cyan"),
-                              ("   Filter: ", "bold"), (state.filter or "*", "magenta" if typing_filter else "dim"))
-    keys = Text("[↑/↓] Move  [Enter] Open/Select  [Bksp/←] Up  [/] Filter  [~] Home  [D] Drives  [Esc] Cancel",
-                style="bold yellow")
-    note = Text("Only folders and supported audio files are shown.", style="dim")
-    return Panel(Group(path_line, t, note, keys), title=f"[bold magenta]{title}[/]",
-                 border_style="bright_cyan", box=box.ROUNDED)
+        t.add_row("", Text("(no matching folders or audio files here)", style="dim italic"), "")
+
+    preview_text = Text("")
+    if state.entries and not state.entries[state.index].is_dir:
+        sel_path = state.entries[state.index].path
+        try:
+            env_str = get_file_waveform_envelope(sel_path, width=20)
+            ai_sel = probe_audio(sel_path)
+            dur_str = f" ({ai_sel.short()})" if ai_sel else ""
+            if env_str:
+                preview_text = Text.assemble(
+                    ("Waveform Dynamics: ", f"bold {th.primary}"),
+                    (f"[{env_str}]", f"bold {th.accent}"),
+                    (dur_str, "dim white"),
+                )
+        except Exception:
+            pass
+
+    path_line = Text.assemble(("Path: ", "bold"), (str("Drives" if state.at_drives else state.cwd), f"bold {th.primary}"),
+                              ("   Filter: ", "bold"), (state.filter or "*", f"bold {th.accent}" if typing_filter else "dim"))
+    if state.dirs_only:
+        keys = Text("[↑/↓] Move  [Enter] Navigate into  [Space/S] SELECT this folder  [Bksp/←] Up  [/] Filter  [~] Home  [D] Drives  [C] Theme  [Esc] Cancel",
+                    style="bold yellow")
+        note = Text("Navigate to the desired folder, then press Space or S to select it.", style="dim")
+    else:
+        keys = Text("[↑/↓] Move  [Enter] Open/Select  [Bksp/←] Up  [/] Filter  [~] Home  [D] Drives  [C] Theme  [Esc] Cancel",
+                    style="bold yellow")
+        note = Text("Only folders and supported audio files are shown.", style="dim")
+    body_elements = [path_line, t]
+    if preview_text.plain:
+        body_elements.append(preview_text)
+    body_elements.extend([note, keys])
+
+    return Panel(Group(*body_elements), title=f"[bold {th.accent}]{title}[/]",
+                 border_style=th.border, box=box.ROUNDED)
 
 
-def pick_file(console: Console, title: str, start: Path | None = None) -> Path | None:
+def pick_file(console: Console, title: str, start: Path | None = None, theme: themes.Theme | None = None) -> Path | None:
     state = PickerState(start)
     typing = False
-    with Live(render(state, title, typing, console.height), console=console, screen=True,
+    with Live(render(state, title, typing, console.height, theme), console=console, screen=True,
               auto_refresh=False) as live:
         while True:
-            live.update(render(state, title, typing, console.height), refresh=True)
+            cur_th = theme or themes.get_theme()
+            live.update(render(state, title, typing, console.height, cur_th), refresh=True)
             k = read_key()
+            if k is None:
+                continue
             if typing:
-                if k.name == "enter" or k.name == "esc":
+                if k.name in ("enter", "esc"):
                     typing = False
                 elif k.name == "backspace":
                     state.filter = state.filter[:-1]
@@ -197,5 +237,71 @@ def pick_file(console: Console, title: str, start: Path | None = None) -> Path |
                     state.home()
                 elif c == "d":
                     state.drives()
+                elif c == "c":
+                    themes.cycle_theme()
+                elif c == "q":
+                    return None
+
+
+def pick_directory(console: Console, title: str, start: Path | None = None, theme: themes.Theme | None = None) -> Path | None:
+    """Picker specialized for selecting directories in batch mode."""
+    state = PickerState(start, dirs_only=True)
+    typing = False
+    with Live(render(state, title, typing, console.height, theme), console=console, screen=True,
+              auto_refresh=False) as live:
+        while True:
+            cur_th = theme or themes.get_theme()
+            live.update(render(state, title, typing, console.height, cur_th), refresh=True)
+            k = read_key()
+            if k is None:
+                continue
+            if typing:
+                if k.name in ("enter", "esc"):
+                    typing = False
+                elif k.name == "backspace":
+                    state.filter = state.filter[:-1]
+                    state.refresh()
+                elif k.name == "char":
+                    state.filter += k.char
+                    state.refresh()
+                elif k.name in ("up", "down"):
+                    state.move(-1 if k.name == "up" else 1)
+                continue
+            if k.name == "esc":
+                return None
+            elif k.name == "space":
+                # Space confirms current directory selection
+                return state.cwd
+            elif k.name == "up":
+                state.move(-1)
+            elif k.name == "down":
+                state.move(1)
+            elif k.name == "pgup":
+                state.move(-10)
+            elif k.name == "pgdn":
+                state.move(10)
+            elif k.name == "home":
+                state.index = 0
+            elif k.name == "end":
+                state.move(len(state.entries))
+            elif k.name in ("backspace", "left"):
+                state.up()
+            elif k.name in ("enter", "right"):
+                # Open directory
+                state.enter()
+            elif k.name == "char":
+                c = k.char.lower()
+                if c == "s":
+                    # 's' to Select current directory
+                    return state.cwd
+                elif c == "/":
+                    typing, state.filter = True, ""
+                    state.refresh()
+                elif c == "~":
+                    state.home()
+                elif c == "d":
+                    state.drives()
+                elif c == "c":
+                    themes.cycle_theme()
                 elif c == "q":
                     return None
