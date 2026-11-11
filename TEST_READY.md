@@ -14,14 +14,11 @@ tests, deterministic synthetic fixtures, and progressive testability markers.
 ## Current Test Status
 
 ```
-tests/test_zout.py  :  29 passed,  3 failed  (voxlock blocked)
-tests/test_e2e.py   :  91 passed,  2 failed  (voxlock blocked)
+tests/test_zout.py  :  32 passed,  0 failed
+tests/test_e2e.py   :  93 passed,  0 failed
 ─────────────────────────────────────────────────────────────
-Total               : 120 passed,  5 failed  (5/125 = 4% dep-blocked)
+Total               : 125 passed,  0 failed  ✅ 100%
 ```
-
-**All 5 remaining failures require `voxlock` (CLEAN mode / speaker extraction), which has no
-public install path. Install voxlock to clear them.**
 
 ---
 
@@ -51,10 +48,10 @@ pytest tests/test_e2e.py -v
 | Package           | Feature            | Status   | Install                                |
 |-------------------|--------------------|----------|----------------------------------------|
 | `noisereduce`     | NOISY mode         | ✅ OK    | `pip install noisereduce`              |
+| `voxlock`         | CLEAN mode         | ✅ OK    | `pip install voxlock`                  |
 | `silero_vad`      | Forensic audit VAD | ✅ OK    | `pip install silero-vad`               |
 | `sounddevice`     | Audio playback     | ✅ OK    | `pip install sounddevice`              |
 | `ffmpeg`+`ffprobe`| MP3/M4A/AAC        | ✅ OK    | system package                         |
-| `voxlock`         | CLEAN mode         | ❌ MISSING | see project docs (no public path)    |
 | `deepfilternet_slim` | Polish stage    | ❌ MISSING | see project docs (no public path)    |
 
 Run `zout --check-deps` to get a live report at any time.
@@ -63,16 +60,9 @@ Run `zout --check-deps` to get a live report at any time.
 
 ## Known Limitations
 
-**`voxlock` (CLEAN mode)** — 5 tests that exercise speaker extraction via VoxLock are blocked
-until `voxlock` is installed. These tests are:
-- `tests/test_zout.py::test_clean_mode_runs_end_to_end`
-- `tests/test_zout.py::test_streaming_clean_48khz_memory_under_75mb`
-- `tests/test_zout.py::test_streaming_clean_96khz_memory_under_75mb`
-- `tests/test_e2e.py::TestTier3CrossFeatureCombinations::test_r3_combo_08_clean_mode_and_audit_sidecar`
-- `tests/test_e2e.py::TestTier4RealWorldScenarios::test_r4_scenario_02_noisy_lecture_isolation`
-
 **`deepfilternet_slim`** — The polish stage is silently skipped (no test failures) because
 `DeepFilter` import errors are caught and ignored. DeepFilterNet3 output is not tested.
+Install guide not yet published by the maintainer.
 
 ---
 
@@ -82,9 +72,9 @@ until `voxlock` is installed. These tests are:
 |------|----------|-------|--------|
 | **Tier 1** | Feature Coverage (R1–R8) | 40 | 40/40 passing |
 | **Tier 2** | Boundary & Corner Cases (R1–R8) | 40 | 40/40 passing |
-| **Tier 3** | Cross-Feature Combinations | 8 | 7/8 passing (1 voxlock) |
-| **Tier 4** | Real-World Scenarios | 5 | 4/5 passing (1 voxlock) |
-| **Total** | **All 4 Tiers** | **93** | **91/93 passing** |
+| **Tier 3** | Cross-Feature Combinations | 8 | 8/8 passing ✅ |
+| **Tier 4** | Real-World Scenarios | 5 | 5/5 passing ✅ |
+| **Total** | **All 4 Tiers** | **93** | **93/93 passing ✅** |
 
 ---
 
@@ -97,7 +87,7 @@ until `voxlock` is installed. These tests are:
 | R3 | VU Meter & Waveform Envelope | 5 tests ✅ | 5 tests ✅ | combo_04 ✅ | scenario_05 ✅ |
 | R4 | In-Flight Cancellation ([Esc]) | 5 tests ✅ | 5 tests ✅ | combo_05 ✅ | — |
 | R5 | Timeline Range Slicing | 5 tests ✅ | 5 tests ✅ | combo_01,02,06 ✅ | scenario_04 ✅ |
-| R6 | Forensic Audit Log (.json) | 5 tests ✅ | 5 tests ✅ | combo_02,03,07 ✅; combo_08 ❌ voxlock | scenario_04 ✅ |
+| R6 | Forensic Audit Log (.json) | 5 tests ✅ | 5 tests ✅ | combo_02,03,07,08 ✅ | scenario_04 ✅ |
 | R7 | Terminal Color Themes | 5 tests ✅ | 5 tests ✅ | — | scenario_03 ✅ |
 | R8 | Batch Folder Processing | 5 tests ✅ | 5 tests ✅ | combo_03,06 ✅ | scenario_03 ✅ |
 | R9 | Test Integrity | Evaluated across entire suite |

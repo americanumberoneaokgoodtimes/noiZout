@@ -392,7 +392,7 @@ def _check_deps() -> int:
     _chk("NOISY mode  (noisereduce spectral gating)", "noisereduce",
          "pip install noisereduce")
     _chk("CLEAN mode  (VoxLock speaker extraction)", "voxlock",
-         "see project docs for voxlock install")
+         "pip install voxlock")
     _chk("Polish stage (DeepFilterNet3 C runtime)", "deepfilternet_slim",
          "see project docs for deepfilternet-slim install")
 

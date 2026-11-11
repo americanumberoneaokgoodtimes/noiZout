@@ -51,13 +51,10 @@ to see which are available.
 | Feature | Package | Install |
 |---------|---------|---------|
 | NOISY mode (spectral denoising) | `noisereduce` | `pip install noisereduce` |
-| CLEAN mode (speaker extraction) | `voxlock` | see notes below |
+| CLEAN mode (speaker extraction) | `voxlock` | `pip install voxlock` |
 | DeepFilterNet3 polish stage | `deepfilternet-slim` | see notes below |
 
-**`noisereduce`** is available on PyPI and is the most commonly used mode.
-
-**`voxlock`** is a proprietary Target-Speaker Extraction runtime. Contact the project maintainer
-for distribution. Without it, all CLEAN mode operations raise an `ImportError` with a clear message.
+**`noisereduce`** and **`voxlock`** are both on PyPI and install with pip.
 
 **`deepfilternet-slim`** is an optional C runtime for the DeepFilterNet3 speech-enhancement polish
 pass. If absent, the polish stage is silently skipped — NOISY and CLEAN processing still run
@@ -183,7 +180,7 @@ zout --check-deps
 ## CLEAN Mode — Speaker Extraction Guide
 
 CLEAN mode uses VoxLock Target-Speaker Extraction (TSE) to isolate one specific voice from a
-multi-speaker recording. It requires the `voxlock` package.
+multi-speaker recording. Install with `pip install voxlock`.
 
 ### How It Works
 
