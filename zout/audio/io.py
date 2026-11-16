@@ -4,8 +4,10 @@ import functools
 import math
 import shutil
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 
 import numpy as np
 import soundfile as sf
@@ -17,6 +19,18 @@ from ..config import NATIVE_EXTENSIONS
 GLYPHS = " ▂▃▄▅▆▇█"
 
 
+def format_duration(seconds: float, *, rounded: bool = False) -> str:
+    """Format duration as HH:MM:SS (>= 1h) or MM:SS (< 1h)."""
+    if not math.isfinite(seconds) or seconds < 0:
+        seconds = 0.0
+    total = max(0, int(round(seconds)) if rounded else int(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
 @dataclass
 class AudioInfo:
     duration: float
@@ -25,8 +39,7 @@ class AudioInfo:
     frames: int = 0
 
     def short(self) -> str:
-        m, s = divmod(int(round(self.duration)), 60)
-        return f"{m:02d}:{s:02d} | {self.samplerate / 1000:g}kHz | Ch{self.channels}"
+        return f"{format_duration(self.duration, rounded=True)} | {self.samplerate / 1000:g}kHz | Ch{self.channels}"
 
 
 def _ffmpeg() -> str:
@@ -34,6 +47,86 @@ def _ffmpeg() -> str:
     if not exe:
         raise RuntimeError("ffmpeg not found on PATH (needed for this audio format)")
     return exe
+
+
+def open_ffmpeg_pcm_stream(
+    path: Path | str,
+    sr: int = 48000,
+    channels: int = 1,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+) -> subprocess.Popen[bytes]:
+    """Open a single sequential f32le PCM stdout pipe from ffmpeg."""
+    cmd = [_ffmpeg(), "-v", "error"]
+    if start_sec is not None and start_sec > 0:
+        cmd.extend(["-ss", f"{float(start_sec):.6f}"])
+    cmd.extend(["-i", str(Path(path))])
+    if end_sec is not None:
+        dur = max(0.0, float(end_sec) - float(start_sec or 0.0))
+        cmd.extend(["-t", f"{dur:.6f}"])
+    cmd.extend([
+        "-f", "f32le", "-acodec", "pcm_f32le",
+        "-ar", str(int(sr)), "-ac", str(int(channels)), "-",
+    ])
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def close_process_quietly(proc: subprocess.Popen[bytes] | None) -> None:
+    """Safely close pipes and terminate a subprocess without raising."""
+    if proc is None:
+        return
+    for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+    try:
+        running = proc.poll() is None if hasattr(proc, "poll") else True
+        if running:
+            if hasattr(proc, "terminate"):
+                proc.terminate()
+            else:
+                proc.kill()
+            proc.wait(timeout=2.0)
+        else:
+            proc.wait(timeout=1.0)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
+
+def read_pcm_frames(
+    stream,
+    num_frames: int,
+    channels: int = 1,
+    mono: bool = True,
+) -> np.ndarray:
+    """Read up to ``num_frames`` of float32 PCM from a binary pipe."""
+    if num_frames <= 0 or stream is None:
+        return np.zeros((0, channels) if not mono and channels > 1 else 0, dtype=np.float32)
+    sample_width = 4 * max(1, int(channels))
+    target_bytes = int(num_frames) * sample_width
+    chunks: list[bytes] = []
+    remaining = target_bytes
+    while remaining > 0:
+        block = stream.read(remaining)
+        if not block:
+            break
+        chunks.append(block)
+        remaining -= len(block)
+    raw = b"".join(chunks) if len(chunks) > 1 else (chunks[0] if chunks else b"")
+    valid = len(raw) - (len(raw) % sample_width)
+    if valid <= 0:
+        return np.zeros((0, channels) if not mono and channels > 1 else 0, dtype=np.float32)
+    arr = np.frombuffer(raw[:valid], dtype=np.float32).copy()
+    if channels > 1:
+        arr2d = arr.reshape(-1, channels)
+        return arr2d.mean(axis=1) if mono else arr2d
+    return arr
 
 
 def parse_time_spec(val: str | float | int | None) -> float | None:  # noqa: PYI041
@@ -139,10 +232,21 @@ def probe_audio(path: Path) -> AudioInfo | None:
             return None
         out = subprocess.run(
             [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries",
-             "stream=sample_rate,channels:format=duration", "-of", "default=nw=1", str(path)],
+             "stream=sample_rate,channels,duration:format=duration", "-of", "default=nw=1", str(path)],
             capture_output=True, text=True, timeout=10, check=False).stdout
-        d = dict(l.split("=", 1) for l in out.split() if "=" in l)
-        dur = float(d.get("duration", 0))
+        d = {}
+        dur = 0.0
+        for l in out.split():
+            if "=" in l:
+                k, v = l.split("=", 1)
+                d[k] = v
+                if k == "duration" and v.strip() not in ("N/A", ""):
+                    try:
+                        parsed_dur = float(v.strip())
+                        if parsed_dur > 0:
+                            dur = parsed_dur
+                    except ValueError:
+                        pass
         # load_audio decodes non-native formats via ffmpeg at 48 kHz (-ar 48000),
         # so report 48000 as the effective rate rather than the native codec rate.
         sr = 48000
@@ -165,6 +269,63 @@ def get_audio_info(path: Path | str) -> AudioInfo:
     if info is None or info.samplerate <= 0 or info.duration <= 0:
         raise RuntimeError(f"Failed to probe audio metadata for {p.name} (ensure ffprobe/ffmpeg is installed)")
     return info
+
+
+def iter_audio_chunks(
+    path: Path | str,
+    chunk_sec: float = 10.0,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+    mono: bool = True,
+    cancel_event: threading.Event | None = None,
+    _get_info=None,
+) -> Iterator[tuple[np.ndarray, int]]:
+    """Stream float32 chunks within [start_sec, end_sec] using SoundFile or 1 ffmpeg pipe."""
+    p = Path(path)
+    if not p.is_file() or p.stat().st_size == 0:
+        return
+    if p.suffix.lower() in NATIVE_EXTENSIONS:
+        with sf.SoundFile(str(p)) as snd:
+            file_sr = snd.samplerate
+            total_frames = snd.frames
+            start_f = max(0, int(round((start_sec or 0.0) * file_sr)))
+            end_f = min(total_frames, int(round(end_sec * file_sr))) if end_sec is not None else total_frames
+            if start_f >= end_f:
+                return
+            snd.seek(start_f)
+            chunk_frames = max(1024, int(chunk_sec * file_sr))
+            pos = start_f
+            while pos < end_f:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError("Cancelled")
+                chunk = snd.read(min(chunk_frames, end_f - pos), dtype="float32", always_2d=True)
+                if len(chunk) == 0:
+                    break
+                pos += len(chunk)
+                if mono:
+                    yield chunk.mean(axis=1), file_sr
+                else:
+                    yield (chunk if chunk.shape[1] > 1 else chunk[:, 0]), file_sr
+    else:
+        info = (_get_info or get_audio_info)(p)
+        file_sr = info.samplerate
+        t_start = max(0.0, float(start_sec or 0.0))
+        t_end = min(info.duration, float(end_sec)) if end_sec is not None else info.duration
+        if t_start >= t_end:
+            return
+        channels = min(2, max(1, int(getattr(info, "channels", 2) or 1)))
+        chunk_frames = max(1024, int(chunk_sec * file_sr))
+        proc = open_ffmpeg_pcm_stream(p, sr=file_sr, channels=channels, start_sec=t_start, end_sec=t_end)
+        try:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError("Cancelled")
+                chunk = read_pcm_frames(proc.stdout, chunk_frames, channels=channels, mono=mono)
+                if len(chunk) == 0:
+                    break
+                yield chunk, file_sr
+        finally:
+            close_process_quietly(proc)
 
 
 def load_audio(
@@ -289,8 +450,8 @@ def _cached_file_waveform(path_str: str, mtime: float, width: int) -> str:
             indices = np.clip(np.round(norm * 7).astype(int), 0, 7)
             return "".join(GLYPHS[i] for i in indices)
         else:
-            # Non-native fallback: read first 60 seconds
-            audio, _ = load_audio(path, mono=True, start_sec=0.0, end_sec=60.0)
+            # Non-native fallback: sample first 15 seconds to keep picker scrolling responsive
+            audio, _ = load_audio(path, mono=True, start_sec=0.0, end_sec=15.0)
             return compute_waveform_envelope(audio, width=width)
     except Exception:
         return " " * width

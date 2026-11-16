@@ -48,6 +48,10 @@ def _calc_meters(block: np.ndarray) -> tuple[float, float, float, float]:
     return (_calc_dbfs(rms_l), _calc_dbfs(rms_r), _calc_dbfs(peak_l), _calc_dbfs(peak_r))
 
 
+class _PlaybackFinished(Exception):
+    """Raised when playback reaches EOF to cleanly terminate HeadlessRunner or audio streams."""
+
+
 class HeadlessRunner:
     """Simulates real-time audio playback when no hardware audio output device is available."""
 
@@ -71,7 +75,7 @@ class HeadlessRunner:
         while not self._stop_event.is_set():
             try:
                 self._callback(outdata, self._blocksize, None, None)
-            except Exception:
+            except (_PlaybackFinished, Exception):
                 break
 
             next_tick += interval
@@ -123,9 +127,19 @@ class AudioPlayer:
         self._duration: float = 0.0
 
     def play_pair(
-        self, original_path: Path | str, processed_path: Path | str, start_with: str = "B"
+        self,
+        original_path: Path | str,
+        processed_path: Path | str,
+        start_with: str = "B",
+        orig_start_sec: float | None = None,
+        orig_end_sec: float | None = None,
+        max_duration_sec: float | None = None,
     ) -> bool:
-        """Load and start playback of an A/B pair. Starts on track A or B."""
+        """Load and start playback of an A/B pair. Starts on track A or B.
+
+        Supports optional original-track time slicing (to match range-sliced output)
+        and ``max_duration_sec`` preview capping for multi-hour recordings.
+        """
         self.stop()
         p_orig = Path(original_path)
         p_proc = Path(processed_path)
@@ -133,12 +147,18 @@ class AudioPlayer:
             return False
 
         try:
+            eff_orig_end = orig_end_sec
+            eff_proc_end = max_duration_sec
+            if max_duration_sec is not None:
+                cap_orig_end = (orig_start_sec or 0.0) + max_duration_sec
+                eff_orig_end = min(eff_orig_end, cap_orig_end) if eff_orig_end is not None else cap_orig_end
+
             if p_orig == p_proc:
-                a_orig, sr_orig = load_audio(p_orig, mono=False)
+                a_orig, sr_orig = load_audio(p_orig, mono=False, start_sec=orig_start_sec, end_sec=eff_orig_end)
                 a_proc, sr_proc = a_orig.copy(), sr_orig
             else:
-                a_orig, sr_orig = load_audio(p_orig, mono=False)
-                a_proc, sr_proc = load_audio(p_proc, mono=False)
+                a_orig, sr_orig = load_audio(p_orig, mono=False, start_sec=orig_start_sec, end_sec=eff_orig_end)
+                a_proc, sr_proc = load_audio(p_proc, mono=False, start_sec=None, end_sec=eff_proc_end)
 
             if len(a_orig) == 0 or len(a_proc) == 0:
                 return False
@@ -209,9 +229,19 @@ class AudioPlayer:
             self.stop()
             return False
 
-    def play(self, path: Path | str, target_name: str = "Audio") -> bool:
+    def play(
+        self,
+        path: Path | str,
+        target_name: str = "Audio",
+        start_sec: float | None = None,
+        end_sec: float | None = None,
+        max_duration_sec: float | None = None,
+    ) -> bool:
         """Backward compatible playback wrapper for single files."""
-        ok = self.play_pair(path, path, start_with="A")
+        ok = self.play_pair(
+            path, path, start_with="A",
+            orig_start_sec=start_sec, orig_end_sec=end_sec, max_duration_sec=max_duration_sec,
+        )
         if ok:
             with self._lock:
                 self._target_name = target_name
@@ -257,17 +287,21 @@ class AudioPlayer:
                     self._meter_levels = ((rms_l, rms_r), (peak_l, peak_r))
 
         if stop_after:
+            with self._lock:
+                self._is_playing = False
+                self._headless_runner = None
             try:
                 import sounddevice as sd
 
                 raise sd.CallbackStop
             except ImportError:
-                pass
+                raise _PlaybackFinished
 
     def _stream_finished(self) -> None:
         with self._lock:
             self._is_playing = False
             self._meter_levels = ((-80.0, -80.0), (-80.0, -80.0))
+            self._headless_runner = None
 
     def toggle_ab(self) -> str:
         """Seamlessly toggle between Track A (original) and B (processed) without touching sample_index."""

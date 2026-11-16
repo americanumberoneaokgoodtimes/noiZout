@@ -14,9 +14,10 @@ tests, deterministic synthetic fixtures, and progressive testability markers.
 ## Current Test Status
 
 ```
-tests/test_zout.py  :  40 passed,  0 failed
-tests/test_e2e.py   :  93 passed,  0 failed
-Full suite (tests/) : 241 passed,  0 failed  ✅ 100%
+tests/test_zout.py              :  47 passed,  0 failed
+tests/test_e2e.py               :  93 passed,  0 failed
+tests/test_audit_hardening_m4.py:  27 passed,  0 failed
+Full suite (tests/)             : 275 passed,  0 failed  ✅ 100%
 ```
 
 ---
@@ -30,7 +31,7 @@ pytest tests/ -v
 ```
 
 Execution characteristics:
-- **Total Test Cases**: 241 (40 unit + 93 E2E + 108 Tier-5 hardening & M1-M3 stress/adversarial tests)
+- **Total Test Cases**: 275 (47 unit + 93 E2E + 27 M4 hardening + 108 Tier-5 hardening & M1-M3 stress/adversarial tests)
 - **Execution Time**: ~2–3 minutes (noisereduce KL-NMF & streaming stress suites)
 - **Network Access**: 0 downloads required (100% offline synthetic fixtures)
 - **Audio Hardware**: Headless-safe (`MockOutputStream` when audio device absent)

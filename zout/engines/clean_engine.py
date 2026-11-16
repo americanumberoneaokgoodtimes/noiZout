@@ -9,7 +9,7 @@ from scipy.ndimage import uniform_filter1d
 
 from ..audio.io import prepare_clean_enrollment, resample
 from ..audio.masking import N_FFT, _istft, _stft, apply_adaptive_mask
-from .noisy_engine import MAX_SAMPLES_PER_CHUNK, _stream_disk_to_disk
+from .noisy_engine import MAX_SAMPLES_PER_CHUNK, _run_with_min_length, _stream_disk_to_disk
 
 Progress = Callable[[str, float], None]
 SR_TSE = 16000
@@ -102,7 +102,7 @@ class CleanVoiceEngine:
             del est
             return res
 
-        return _process_chunk(main), info
+        return _run_with_min_length(main, N_FFT, _process_chunk), info
 
     def run_streaming(
         self,
@@ -172,11 +172,14 @@ class CleanVoiceEngine:
         def _chunk_progress(msg: str, f: float) -> None:
             p(msg, 0.12 + f * 0.88)
 
+        def _guarded_chunk(chunk: np.ndarray) -> np.ndarray:
+            return _run_with_min_length(chunk, N_FFT, process_chunk)
+
         stats = _stream_disk_to_disk(
             main_path=main_path,
             out_path=out_path,
             sr=sr,
-            process_chunk=process_chunk,
+            process_chunk=_guarded_chunk,
             chunk_sec=chunk_sec,
             overlap_sec=overlap_sec,
             start_sec=start_sec,

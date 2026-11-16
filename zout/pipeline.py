@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import math
 import os
 import threading
@@ -30,11 +31,13 @@ class Result:
 
 def _cleanup_partial(path: Path | None) -> None:
     """Safely unlink partially written output and temporary buffer files."""
-    if path is not None and path.exists():
-        try:
-            path.unlink()
-        except OSError:
-            pass
+    if path is not None:
+        for p in (path, path.with_suffix(".json")):
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
     if path is not None and path.parent.exists():
         for tmp_f in path.parent.glob("*.tmp"):
             try:
@@ -82,6 +85,8 @@ def run_streaming(
         return None
 
     ref, ref_sr = load_audio(cfg.reference)
+    if len(ref) < max(2048, sr // 4):
+        raise ValueError("reference recording is too short")
 
     def sub(msg: str, f: float) -> None:
         p(msg, 0.05 + 0.9 * f)
@@ -123,6 +128,9 @@ def run_streaming(
     except InterruptedError:
         _cleanup_partial(out_path)
         return None
+    except Exception:
+        _cleanup_partial(out_path)
+        raise
 
     if cfg.is_cancelled():
         _cleanup_partial(out_path)
@@ -148,8 +156,8 @@ def run_streaming(
                 in_rms=in_rms,
                 out_rms=out_rms,
             )
-        except Exception:
-            pass
+        except Exception as ex:
+            notes["audit_error"] = str(ex)
 
     p("Done", 1.0)
     return Result(path, time.time() - t0, in_rms, out_rms, supp_db, notes, audit_path=audit_sidecar)
@@ -265,6 +273,17 @@ def run_batch(
             failures.append(f"{audio_file.name}: {ex}")
 
     p(f"Batch completed: {success_count}/{len(audio_files)} successful", 1.0)
+    if failures:
+        err_log_path = out_dir / "batch_errors.log"
+        try:
+            with open(err_log_path, "w", encoding="utf-8") as f:
+                f.write(f"# Batch processing errors — {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
+                f.write(f"# Total: {len(audio_files)}, Success: {success_count}, Failures: {len(failures)}\n\n")
+                for err in failures:
+                    f.write(f"{err}\n")
+        except OSError:
+            pass
+
     if all_results:
         n = len(all_results)
         avg_in_rms = sum(r.in_rms for r in all_results) / n
@@ -339,6 +358,8 @@ def run_job(
 
         ref, ref_sr = load_audio(cfg.reference)
         main, sr = load_audio(cfg.main, start_sec=cfg.start_sec, end_sec=cfg.end_sec)
+        if len(ref) < max(2048, sr // 4):
+            raise ValueError("reference recording is too short")
         if len(main) < sr // 4:
             raise ValueError("main recording is too short")
 
@@ -407,8 +428,8 @@ def run_job(
                     in_rms=in_rms,
                     out_rms=out_rms,
                 )
-            except Exception:
-                pass
+            except Exception as ex:
+                notes["audit_error"] = str(ex)
 
         p("Done", 1.0)
         return Result(path, time.time() - t0, in_rms, out_rms, supp_db, notes, audit_path=audit_sidecar)
@@ -416,3 +437,6 @@ def run_job(
     except InterruptedError:
         _cleanup_partial(out_path)
         return None
+    except Exception:
+        _cleanup_partial(out_path)
+        raise

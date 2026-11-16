@@ -131,6 +131,17 @@ class JobConfig:
         return self.cancel_event is not None and self.cancel_event.is_set()
 
 
+def get_ffmpeg_install_hint() -> str:
+    """Return OS-specific package manager install command hint for ffmpeg."""
+    import sys
+    if sys.platform == "win32":
+        return "winget install Gyan.FFmpeg (or choco install ffmpeg)"
+    elif sys.platform == "darwin":
+        return "brew install ffmpeg"
+    else:
+        return "sudo apt install ffmpeg (or pacman -S ffmpeg / dnf install ffmpeg)"
+
+
 def collect_deps_status() -> list[tuple[str, str, str, str]]:
     """Return runtime dependency checks as (section, label, status_tag, detail)."""
     import shutil
@@ -181,7 +192,8 @@ def collect_deps_status() -> list[tuple[str, str, str, str]]:
         rows.append(("Media format support", "ffmpeg + ffprobe", "OK", "MP3, M4A, AAC, etc."))
     else:
         missing = " + ".join(x for x, ok in [("ffmpeg", ffmpeg_ok), ("ffprobe", ffprobe_ok)] if not ok)
-        rows.append(("Media format support", missing, "MISSING", "MP3/M4A/AAC will fail to load — install ffmpeg"))
+        hint = get_ffmpeg_install_hint()
+        rows.append(("Media format support", missing, "MISSING", f"MP3/M4A/AAC will fail — install via: {hint}"))
 
     rows.append((
         "Playback",

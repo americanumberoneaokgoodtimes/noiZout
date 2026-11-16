@@ -7,14 +7,20 @@ from pathlib import Path
 from rich.console import Console
 
 from . import __version__
-from .config import SUPPORTED_AUDIO_EXTENSIONS, JobConfig, ReferenceRole, collect_deps_status
+from .config import (
+    SUPPORTED_AUDIO_EXTENSIONS,
+    JobConfig,
+    ReferenceRole,
+    collect_deps_status,
+    get_ffmpeg_install_hint,
+)
 
 
 def _cli(args) -> int:
     from rich.progress import Progress
 
-    from .audio.io import load_audio, parse_time_spec, save_audio
-    from .audio.noise_extractor import extract_noise_profile
+    from .audio.io import parse_time_spec, save_audio
+    from .audio.noise_extractor import extract_noise_profile_from_file
     from .pipeline import run_job
 
     console = Console()
@@ -24,46 +30,43 @@ def _cli(args) -> int:
     main_path = Path(args.main) if args.main else None
     batch_dir = Path(args.batch) if getattr(args, "batch", None) else None
     out_dir = Path(args.out_dir) if getattr(args, "out_dir", None) else None
+    start_sec = parse_time_spec(args.start) if getattr(args, "start", None) else None
+    end_sec = parse_time_spec(args.end) if getattr(args, "end", None) else None
+    audit_path = Path(args.audit_path) if getattr(args, "audit_path", None) else None
+    audit = getattr(args, "audit", False) or (audit_path is not None)
 
     if args.auto_noise and main_path:
         size_mb = main_path.stat().st_size / 1_048_576
         if not args.quiet:
             with Progress(console=console) as _pg:
-                _task = _pg.add_task(f"Loading audio ({size_mb:.0f} MB)...", total=100)
-                main_audio, sr = load_audio(main_path, mono=True)
-                dur_s = len(main_audio) / sr
-                _pg.update(_task, completed=8,
-                           description=f"Scanning {dur_s / 60:.1f} min for speech-free noise...")
-                noise_res = extract_noise_profile(
-                    main_audio,
-                    sr=sr,
+                _task = _pg.add_task(f"Scanning audio ({size_mb:.0f} MB) for noise...", total=100)
+                noise_res = extract_noise_profile_from_file(
+                    main_path,
                     n_chunks=args.noise_chunks,
                     chunk_sec=args.noise_len,
                     mode=args.noise_mode,
-                    progress=lambda msg, f: _pg.update(_task, completed=8 + f * 92, description=msg),
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                    progress=lambda msg, f: _pg.update(_task, completed=f * 100, description=msg),
                 )
         else:
-            main_audio, sr = load_audio(main_path, mono=True)
-            noise_res = extract_noise_profile(
-                main_audio,
-                sr=sr,
+            noise_res = extract_noise_profile_from_file(
+                main_path,
                 n_chunks=args.noise_chunks,
                 chunk_sec=args.noise_len,
                 mode=args.noise_mode,
+                start_sec=start_sec,
+                end_sec=end_sec,
             )
         save_path = Path(args.save_noise) if args.save_noise else main_path.with_name(main_path.stem + "_noise_profile.wav")
-        save_audio(save_path, noise_res.audio, sr)
+        save_audio(save_path, noise_res.audio, noise_res.sr)
         ref_path = save_path
         role = ReferenceRole.NOISY
         if not args.quiet:
-            console.print(f"[green]Extracted {len(noise_res.chunks)} noise sections ({len(noise_res.audio) / sr:.1f}s)[/] -> {save_path}")
+            console.print(f"[green]Extracted {len(noise_res.chunks)} noise sections ({len(noise_res.audio) / noise_res.sr:.1f}s)[/] -> {save_path}")
             if noise_res.warnings:
                 for w in noise_res.warnings:
                     console.print(f"[yellow]Notice:[/] {w}")
-
-    start_sec = parse_time_spec(args.start) if getattr(args, "start", None) else None
-    end_sec = parse_time_spec(args.end) if getattr(args, "end", None) else None
-    audit = getattr(args, "audit", False)
 
     cfg = JobConfig(
         reference=ref_path,
@@ -78,6 +81,7 @@ def _cli(args) -> int:
         chunk_duration=getattr(args, "chunk_duration", 60.0),
         overlap_duration=getattr(args, "overlap_duration", 2.0),
         audit=audit,
+        audit_path=audit_path,
         batch_dir=batch_dir,
         out_dir=out_dir,
     )
@@ -104,10 +108,15 @@ def _cli(args) -> int:
         console.print(f"[green]Batch processing complete:[/] {success}/{total} files processed into {res.output}")
         for f in failures:
             console.print(f"[yellow]  failed:[/] {f}")
+        err_log = Path(res.output) / "batch_errors.log"
+        if err_log.is_file():
+            console.print(f"[yellow]Error log saved to:[/] {err_log}")
     else:
         console.print(f"[green]Wrote[/] {res.output}  ({res.seconds:.1f}s, noise floor -{res.suppression_db:.1f} dB)")
     if res.notes.get("warning"):
         console.print(f"[yellow]warning:[/] {res.notes['warning']}")
+    if res.notes.get("audit_error"):
+        console.print(f"[yellow]warning (audit skipped):[/] {res.notes['audit_error']}")
     if res.audit_path and res.audit_path.is_file():
         console.print(f"[cyan]Forensic audit manifest saved:[/] {res.audit_path}")
     return 0
@@ -125,7 +134,8 @@ def _interactive() -> int:
     cfg = JobConfig()
     # Preflight: warn if ffmpeg is missing (needed for MP3/M4A/AAC)
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        msg = "ffmpeg not found — MP3/M4A/AAC files will fail to load. Run 'zout --check-deps' for details."
+        hint = get_ffmpeg_install_hint()
+        msg = f"ffmpeg not found ({hint}) — MP3/M4A/AAC files will fail to load. Run 'zout --check-deps' for details."
     else:
         msg = ""
     last_dir: Path | None = None
@@ -218,9 +228,10 @@ def _interactive() -> int:
                     if player.is_playing() and player._target_name == "Noise Reference":
                         player.stop()
                         msg = "Stopped noise playback."
-                    else:
-                        player.play(cfg.reference, "Noise Reference")
+                    elif player.play(cfg.reference, "Noise Reference", max_duration_sec=120.0):
                         msg = f"▶ Playing noise reference: {cfg.reference.name}"
+                    else:
+                        msg = f"[bold red]Could not play reference audio: {cfg.reference.name}[/]"
                 else:
                     msg = "No reference noise audio available yet. Pick one [1] or auto-extract [N]."
             elif c == "p":  # Lowercase p: Play main subject audio
@@ -228,9 +239,13 @@ def _interactive() -> int:
                     if player.is_playing() and player._target_name == "Main Recording":
                         player.stop()
                         msg = "Stopped main recording playback."
-                    else:
-                        player.play(cfg.main, "Main Recording")
+                    elif player.play(
+                        cfg.main, "Main Recording",
+                        start_sec=cfg.start_sec, end_sec=cfg.end_sec, max_duration_sec=120.0,
+                    ):
                         msg = f"▶ Playing main recording: {cfg.main.name}"
+                    else:
+                        msg = f"[bold red]Could not play main recording: {cfg.main.name}[/]"
                 else:
                     msg = "No main recording selected yet. Pick one [2]."
             elif c in (" ", "s", "S"):
@@ -270,7 +285,10 @@ def _interactive() -> int:
                         and res.output and res.output.is_file()
                     )
                     if has_pair:
-                        player.play_pair(cfg.main, res.output, start_with="B")
+                        player.play_pair(
+                            cfg.main, res.output, start_with="B",
+                            orig_start_sec=cfg.start_sec, orig_end_sec=cfg.end_sec, max_duration_sec=180.0,
+                        )
 
                     with Live(screens.result_card(res, player.status_text(), theme=cur_th),
                               console=console, refresh_per_second=15) as live:
@@ -286,7 +304,10 @@ def _interactive() -> int:
                                 if player.is_playing():
                                     player.stop()
                                 elif has_pair:
-                                    player.play_pair(cfg.main, res.output, start_with="B")
+                                    player.play_pair(
+                                        cfg.main, res.output, start_with="B",
+                                        orig_start_sec=cfg.start_sec, orig_end_sec=cfg.end_sec, max_duration_sec=180.0,
+                                    )
                             elif rk.name == "char" and rk.char == "P":
                                 if has_pair:
                                     if player.is_playing():
@@ -295,12 +316,15 @@ def _interactive() -> int:
                                         else:
                                             player.toggle_ab()
                                     else:
-                                        player.play_pair(cfg.main, res.output, start_with="B")
+                                        player.play_pair(
+                                            cfg.main, res.output, start_with="B",
+                                            orig_start_sec=cfg.start_sec, orig_end_sec=cfg.end_sec, max_duration_sec=180.0,
+                                        )
                                 elif res.output and res.output.is_file():
                                     if player.is_playing():
                                         player.stop()
                                     else:
-                                        player.play(res.output, "Processed Output")
+                                        player.play(res.output, "Processed Output", max_duration_sec=180.0)
                             elif rk.name == "char" and rk.char == "p":
                                 if has_pair:
                                     if player.is_playing():
@@ -309,12 +333,18 @@ def _interactive() -> int:
                                         else:
                                             player.toggle_ab()
                                     else:
-                                        player.play_pair(cfg.main, res.output, start_with="A")
+                                        player.play_pair(
+                                            cfg.main, res.output, start_with="A",
+                                            orig_start_sec=cfg.start_sec, orig_end_sec=cfg.end_sec, max_duration_sec=180.0,
+                                        )
                                 elif cfg.main and cfg.main.is_file():
                                     if player.is_playing():
                                         player.stop()
                                     else:
-                                        player.play(cfg.main, "Main Recording")
+                                        player.play(
+                                            cfg.main, "Main Recording",
+                                            start_sec=cfg.start_sec, end_sec=cfg.end_sec, max_duration_sec=180.0,
+                                        )
                             elif rk.name == "char" and rk.char.lower() == "c":
                                 themes.cycle_theme()
                             elif rk.name in ("enter", "esc"):
@@ -355,6 +385,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("-V", "--version", action="version", version=f"zout {__version__}")
     ap.add_argument("--check-deps", action="store_true",
                     help="report which optional runtime features are available and exit")
+    ap.add_argument("--download-models", "--preload", action="store_true", dest="preload_models",
+                    help="pre-download and cache model weights (VoxLock TSE, Silero VAD) for offline / air-gapped use and exit")
 
     # Timeline range slicing options (R5)
     ts_group = ap.add_argument_group("timeline range slicing options")
@@ -366,6 +398,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # Forensic audit sidecar (R6)
     ap.add_argument("--audit", "--json", action="store_true", dest="audit",
                     help="generate forensic JSON audit manifest sidecar alongside output audio")
+    ap.add_argument("--audit-path", metavar="FILE", dest="audit_path",
+                    help="explicit output path for forensic JSON audit manifest (implies --audit)")
 
     # Batch folder processing options (R8)
     batch_group = ap.add_argument_group("batch folder processing options")
@@ -449,6 +483,10 @@ def _validate(ap: argparse.ArgumentParser, args) -> None:
         ap.error("--overlap-duration cannot be negative")
     if getattr(args, "overlap_duration", 2.0) >= getattr(args, "chunk_duration", 60.0):
         ap.error("--overlap-duration must be strictly less than --chunk-duration")
+    if getattr(args, "noise_chunks", 6) < 1:
+        ap.error("--noise-chunks must be >= 1")
+    if getattr(args, "noise_len", 2.0) < 0.5:
+        ap.error("--noise-len must be >= 0.5 seconds")
 
 
 def _check_deps() -> int:
@@ -468,12 +506,65 @@ def _check_deps() -> int:
     return 0
 
 
+def _preload_models() -> int:
+    """Pre-cache model weights for air-gapped / offline deployments."""
+    console = Console()
+    console.print("[bold cyan]noiZout Model Pre-Cache (Air-Gapped Setup)[/bold cyan]")
+    errors = 0
+
+    # 1. Silero VAD
+    console.print("\n[bold]1. Checking Silero VAD model...[/bold]")
+    try:
+        from .audio.noise_extractor import _load_vad_model
+        vad_model, _ = _load_vad_model()
+        if vad_model is not None:
+            console.print("  [green]OK[/green]  Silero VAD model verified and cached.")
+        else:
+            console.print("  [yellow]WARNING[/yellow]  pysilero-vad / silero-vad not installed.")
+    except Exception as ex:
+        console.print(f"  [red]FAILED[/red]  Silero VAD pre-cache failed: {ex}")
+        errors += 1
+
+    # 2. VoxLock TSE
+    console.print("\n[bold]2. Checking VoxLock target speaker extraction model weights...[/bold]")
+    try:
+        import voxlock
+        _ = voxlock.VoxLock(precision="int8")
+        console.print("  [green]OK[/green]  VoxLock model weights verified and cached.")
+    except ImportError:
+        console.print("  [yellow]WARNING[/yellow]  voxlock is not installed (optional CLEAN mode).")
+    except Exception as ex:
+        console.print(f"  [red]FAILED[/red]  VoxLock model download failed: {ex}")
+        errors += 1
+
+    # 3. DeepFilterNet polish (if available)
+    console.print("\n[bold]3. Checking DeepFilterNet speech polish...[/bold]")
+    try:
+        from .engines.deepfilter import DeepFilter
+        df = DeepFilter(atten_lim_db=100.0)
+        backend = df._get_backend()
+        console.print(f"  [green]OK[/green]  DeepFilterNet backend verified: {backend.__class__.__name__}")
+    except ImportError:
+        console.print("  [yellow]INFO[/yellow]  DeepFilterNet optional polish backend not installed.")
+    except Exception as ex:
+        console.print(f"  [yellow]INFO[/yellow]  DeepFilterNet check: {ex}")
+
+    if errors > 0:
+        console.print(f"\n[red]Pre-caching finished with {errors} errors.[/red]")
+        return 1
+    console.print("\n[bold green]All available models are pre-cached and ready for offline deployment![/bold green]")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = _build_parser()
     args = ap.parse_args(argv)
 
     if getattr(args, "check_deps", False):
         return _check_deps()
+
+    if getattr(args, "preload_models", False):
+        return _preload_models()
 
     if getattr(args, "batch", None):
         if not args.ref or not args.role:

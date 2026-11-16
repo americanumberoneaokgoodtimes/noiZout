@@ -8,6 +8,13 @@ HOP = 512
 
 
 def _stft(x: np.ndarray, sr: int):
+    """Compute STFT with zero padding for short signals and boundary-safe reconstruction.
+
+    Note: scipy requires boundary='zeros' and padded=True in stft paired with
+    boundary=True in istft for exact overlap-add inversion linearity.
+    """
+    if len(x) < N_FFT:
+        x = np.pad(x, (0, N_FFT - len(x)))
     _, _, Z = stft(x, fs=sr, nperseg=N_FFT, noverlap=N_FFT - HOP, boundary="zeros", padded=True)
     return Z
 
@@ -41,7 +48,12 @@ def apply_adaptive_mask(x: np.ndarray, y_est: np.ndarray, sr: int, strength: flo
 
 def noise_suppression_db(x_in: np.ndarray, y_out: np.ndarray) -> float:
     """Reduction in 10th-percentile frame energy (noise-floor proxy), in dB (positive = quieter)."""
+    if len(x_in) == 0 or len(y_out) == 0:
+        return -120.0
+
     def floor(a):
+        if len(a) == 0:
+            return -120.0
         h = 1024
         m = len(a) // h
         if m == 0:
@@ -49,4 +61,5 @@ def noise_suppression_db(x_in: np.ndarray, y_out: np.ndarray) -> float:
             return float(10 * np.log10(np.mean(a ** 2) + 1e-12))
         e = 10 * np.log10(np.mean(a[: m * h].reshape(m, h) ** 2, axis=1) + 1e-12)
         return float(np.percentile(e, 10))
+
     return floor(x_in) - floor(y_out)

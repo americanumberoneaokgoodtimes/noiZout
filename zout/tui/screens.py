@@ -14,8 +14,16 @@ from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 
-from ..audio.io import compute_waveform_envelope, parse_time_spec, probe_audio, save_audio
-from ..audio.noise_extractor import extract_noise_profile
+from ..audio.io import (
+    compute_waveform_envelope,
+    format_duration,
+    get_audio_info,
+    load_audio,
+    parse_time_spec,
+    probe_audio,
+    save_audio,
+)
+from ..audio.noise_extractor import extract_noise_profile, extract_noise_profile_from_file
 from ..audio.player import player
 from ..config import JobConfig, ReferenceRole, collect_deps_status
 from ..pipeline import Result, run_job
@@ -126,10 +134,7 @@ def render_playback_card(player_inst: Any, title: str = "Audio Playback", theme:
     sample_idx = getattr(player_inst, "sample_index", 0)
     sr = getattr(player_inst, "_sr", 44100)
     elapsed = min(dur, max(0.0, sample_idx / sr)) if dur > 0 else 0.0
-
-    m_el, s_el = divmod(int(elapsed), 60)
-    m_dur, s_dur = divmod(int(dur), 60)
-    time_str = f"{m_el:02d}:{s_el:02d} / {m_dur:02d}:{s_dur:02d}"
+    time_str = f"{format_duration(elapsed)} / {format_duration(dur)}"
 
     pbar = ProgressBar(total=dur if dur > 0 else 1.0, completed=elapsed, width=32,
                        complete_style=th.primary, finished_style=th.success)
@@ -179,13 +184,8 @@ def dashboard(cfg: JobConfig, msg: str = "", theme: themes.Theme | None = None) 
 
     # Timeline range slicing row (R5)
     if cfg.start_sec is not None or cfg.end_sec is not None:
-        def _fmt(s: float | None) -> str:
-            if s is None:
-                return "end"
-            m, sec = divmod(int(s), 60)
-            return f"{m:02d}:{sec:02d}"
-        s_txt = _fmt(cfg.start_sec or 0.0)
-        e_txt = _fmt(cfg.end_sec)
+        s_txt = format_duration(cfg.start_sec or 0.0)
+        e_txt = format_duration(cfg.end_sec) if cfg.end_sec is not None else "end"
         range_txt = Text.assemble((f"Slice [{s_txt} -> {e_txt}]", f"bold {th.accent}"), ("  [Press T to edit]", "dim"))
     else:
         range_txt = Text.assemble(("Full recording", "dim"), ("  [Press T to slice range]", "dim"))
@@ -519,10 +519,7 @@ def prompt_timeline_range(console: Console, cfg: JobConfig, theme: themes.Theme 
             total_dur = ai.duration
 
     def _fmt(s: float | None) -> str:
-        if s is None:
-            return ""
-        m, sec = divmod(int(s), 60)
-        return f"{m:02d}:{sec:02d}"
+        return "" if s is None else format_duration(s)
 
     start_str = _fmt(cfg.start_sec) if cfg.start_sec is not None else ""
     end_str = _fmt(cfg.end_sec) if cfg.end_sec is not None else ""
@@ -549,8 +546,10 @@ def prompt_timeline_range(console: Console, cfg: JobConfig, theme: themes.Theme 
                 err_msg = f"Start time ({s_val:.1f}s) must be strictly before end time ({e_val:.1f}s)"
 
         if not err_msg and total_dur is not None:
-            if s_val is not None and s_val > total_dur:
+            if s_val is not None and s_val >= total_dur:
                 err_msg = f"Start time exceeds file duration ({_fmt(total_dur)})"
+            elif e_val is not None and e_val > total_dur:
+                err_msg = f"End time exceeds file duration ({_fmt(total_dur)})"
 
         bar_w = 32
         if total_dur and total_dur > 0:
@@ -627,10 +626,16 @@ def prompt_timeline_range(console: Console, cfg: JobConfig, theme: themes.Theme 
             delta = 1.0 if k.name == "right" else -1.0
             if field == 0:
                 cur = s_val if s_val is not None else 0.0
-                start_str = _fmt(max(0.0, cur + delta))
+                nxt = max(0.0, cur + delta)
+                if total_dur is not None:
+                    nxt = min(total_dur, nxt)
+                start_str = _fmt(nxt)
             else:
                 cur = e_val if e_val is not None else (total_dur or 60.0)
-                end_str = _fmt(max(0.0, cur + delta))
+                nxt = max(0.0, cur + delta)
+                if total_dur is not None:
+                    nxt = min(total_dur, nxt)
+                end_str = _fmt(nxt)
         elif k.name == "char":
             c = k.char
             if c in "0123456789:.":
@@ -748,6 +753,8 @@ def result_card(res: Result | Exception | None, play_status: str = "", theme: th
         lines.append(Text(res.notes["warning"], style="yellow"))
     if res.notes.get("polish_error"):
         lines.append(Text("Polish skipped: " + res.notes["polish_error"], style="yellow"))
+    if res.notes.get("audit_error"):
+        lines.append(Text("Audit manifest skipped: " + res.notes["audit_error"], style="yellow"))
     if res.audit_path is not None:
         lines.append(Text.assemble(("Audit: ", "bold"), (str(res.audit_path), "dim")))
     if res.notes.get("batch"):
@@ -898,31 +905,23 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
 
     def worker():
         try:
-            size_mb = cfg.main.stat().st_size / 1_048_576
-            cb(f"Loading main audio ({size_mb:.0f} MB)...", 0.03)
-            main_audio, audio_sr = load_audio(cfg.main, mono=True)
-            if cancel_ev.is_set():
-                raise InterruptedError("Cancelled")
-            dur_s = len(main_audio) / audio_sr
-            m, s = divmod(int(dur_s), 60)
-            cb(f"Audio loaded ({m:02d}:{s:02d} at {audio_sr // 1000}kHz) — starting scan...", 0.08)
-
             def _scan_cb(msg: str, f: float) -> None:
-                cb(msg, 0.08 + f * 0.84)
+                cb(msg, 0.04 + f * 0.90)
 
-            res = extract_noise_profile(
-                main_audio,
-                sr=audio_sr,
+            res = extract_noise_profile_from_file(
+                cfg.main,
                 n_chunks=n_chunks,
                 chunk_sec=chunk_sec,
                 mode=modes[mode_idx][0],
+                start_sec=cfg.start_sec,
+                end_sec=cfg.end_sec,
                 progress=_scan_cb,
                 cancel_event=cancel_ev,
             )
             if cancel_ev.is_set():
                 raise InterruptedError("Cancelled")
             out_noise_path = cfg.default_noise_output()
-            save_audio(out_noise_path, res.audio, audio_sr)
+            save_audio(out_noise_path, res.audio, res.sr)
             res.output_path = out_noise_path
             res_box["result"] = res
         except InterruptedError:
@@ -994,9 +993,9 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
             Text("Detected Speech-Free Timeline Sections:", style=f"bold {th.primary}"),
         ]
         for idx, (st_sec, en_sec) in enumerate(result.chunks[:6], 1):
-            st_m, st_s = divmod(int(st_sec), 60)
-            en_m, en_s = divmod(int(en_sec), 60)
-            card_lines.append(Text(f"  Chunk #{idx}:  {st_m:02d}:{st_s:02d} - {en_m:02d}:{en_s:02d}  ({en_sec - st_sec:.1f}s)", style="dim white"))
+            card_lines.append(
+                Text(f"  Chunk #{idx}:  {format_duration(st_sec)} - {format_duration(en_sec)}  ({en_sec - st_sec:.1f}s)", style="dim white")
+            )
         if len(result.chunks) > 6:
             card_lines.append(Text(f"  ... and {len(result.chunks) - 6} more sections", style="dim"))
 

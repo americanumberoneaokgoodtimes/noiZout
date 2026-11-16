@@ -8,12 +8,45 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from ..audio.io import NATIVE_EXTENSIONS, get_audio_info, load_audio, local_peak_limit
-from ..audio.masking import _istft, _stft, apply_adaptive_mask
+from ..audio.io import (
+    NATIVE_EXTENSIONS,
+    close_process_quietly,
+    get_audio_info,
+    local_peak_limit,
+    open_ffmpeg_pcm_stream,
+    read_pcm_frames,
+)
+from ..audio.masking import N_FFT, _istft, _stft, apply_adaptive_mask
 
 Progress = Callable[[str, float], None]
 
 MAX_SAMPLES_PER_CHUNK: int = 240_000  # Caps peak memory < 75MB (and < 150MB) across all sample rates (e.g. 5s @ 48kHz, 2.5s @ 96kHz, 15s @ 16kHz)
+
+
+def _ensure_min_ref_length(ref: np.ndarray, min_len: int = N_FFT) -> np.ndarray:
+    """Ensure noise reference array has at least `min_len` samples for full-bin STFT."""
+    if len(ref) >= min_len:
+        return ref
+    if len(ref) == 0:
+        return np.zeros(min_len, dtype=np.float32)
+    reps = int(math.ceil(min_len / len(ref)))
+    return np.tile(ref.astype(np.float32, copy=False), reps)[:min_len]
+
+
+def _run_with_min_length(
+    chunk: np.ndarray,
+    min_len: int,
+    fn: Callable[[np.ndarray], np.ndarray],
+) -> np.ndarray:
+    """Pad ultra-short trailing chunks (< N_FFT) cleanly so STFT/noisereduce cannot fail."""
+    orig_len = len(chunk)
+    if orig_len >= min_len:
+        return fn(chunk)
+    if orig_len == 0:
+        return chunk
+    pad_mode = "reflect" if orig_len > 1 else "constant"
+    padded = np.pad(chunk, (0, min_len - orig_len), mode=pad_mode)
+    return fn(padded)[:orig_len]
 
 
 def kl_nmf(
@@ -109,14 +142,24 @@ def _stream_disk_to_disk(
     if N_overlap >= N_chunk:
         N_overlap = N_chunk // 4
 
-    def read_input(start_f: int, num_f: int) -> np.ndarray:
+    pcm_proc = None
+    in_overlap: np.ndarray | None = None
+    if not is_native:
+        s_sec = start_frame / float(file_sr)
+        e_sec = end_frame / float(file_sr)
+        pcm_proc = open_ffmpeg_pcm_stream(main_path, sr=file_sr, channels=1, start_sec=s_sec, end_sec=e_sec)
+
+    def read_input(num_f: int, start_f: int) -> np.ndarray:
         if is_native:
             data, _ = sf.read(str(main_path), start=start_f, frames=num_f, dtype="float32", always_2d=True)
             out = data.mean(axis=1) if data.ndim > 1 else data.reshape(-1)
         else:
-            c_start = start_f / float(file_sr)
-            c_end = (start_f + num_f) / float(file_sr)
-            out, _ = load_audio(main_path, mono=True, start_sec=c_start, end_sec=c_end)
+            if in_overlap is not None and len(in_overlap) > 0:
+                need = max(0, num_f - len(in_overlap))
+                new_part = read_pcm_frames(pcm_proc.stdout, need, channels=1) if need > 0 else np.zeros(0, dtype=np.float32)
+                out = np.concatenate([in_overlap, new_part]) if len(new_part) else in_overlap.copy()
+            else:
+                out = read_pcm_frames(pcm_proc.stdout, num_f, channels=1)
         if len(out) > num_f:
             return out[:num_f]
         if len(out) < num_f:
@@ -141,7 +184,7 @@ def _stream_disk_to_disk(
                 if cancel_event is not None and cancel_event.is_set():
                     raise InterruptedError("Cancelled")
                 read_len = min(N_chunk, end_frame - offset)
-                chunk_in = read_input(offset, read_len)
+                chunk_in = read_input(read_len, offset)
                 in_sum_sq += float(np.sum(chunk_in.astype(np.float64) ** 2))
                 _collect_frame_energies(chunk_in, in_frame_energies)
 
@@ -180,12 +223,13 @@ def _stream_disk_to_disk(
 
                 is_last = (offset + N_chunk >= end_frame)
                 read_len = min(N_chunk, end_frame - offset)
-                chunk_in = read_input(offset, read_len)
-
-                if tail is None:
-                    in_slice = chunk_in[:hop] if not is_last else chunk_in
+                chunk_in = read_input(read_len, offset)
+                if not is_native and not is_last:
+                    in_overlap = chunk_in[hop:]
                 else:
-                    in_slice = chunk_in[N_overlap:]
+                    in_overlap = None
+
+                in_slice = chunk_in if is_last else chunk_in[:hop]
                 in_sum_sq += float(np.sum(in_slice.astype(np.float64) ** 2))
                 _collect_frame_energies(in_slice, in_frame_energies)
 
@@ -242,6 +286,7 @@ def _stream_disk_to_disk(
                     raise InterruptedError("Cancelled")
 
     finally:
+        close_process_quietly(pcm_proc)
         if out_sf is not None and not out_sf.closed:
             out_sf.close()
 
@@ -293,6 +338,7 @@ class NoisyAcousticEngine:
             raise InterruptedError("Cancelled")
 
         p("Training noise profile (KL-NMF)", 0.0)
+        ref = _ensure_min_ref_length(ref, N_FFT)
         R = np.abs(_stft(ref, sr)).astype(np.float32)
         if R.shape[1] > 800:  # cap training frames
             R = R[:, :: R.shape[1] // 800 + 1]
@@ -368,7 +414,7 @@ class NoisyAcousticEngine:
             return apply_adaptive_mask(chunk, est, sr, strength, max_atten_db)
 
         p("Noise profile ready", 0.10)
-        return _process_single(main), info
+        return _run_with_min_length(main, N_FFT, _process_single), info
 
     def run_streaming(
         self,
@@ -399,6 +445,7 @@ class NoisyAcousticEngine:
             raise InterruptedError("Cancelled")
 
         p("Training noise profile (KL-NMF)", 0.0)
+        ref = _ensure_min_ref_length(ref, N_FFT)
         R = np.abs(_stft(ref, sr)).astype(np.float32)
         if R.shape[1] > 800:
             R = R[:, :: R.shape[1] // 800 + 1]
@@ -464,11 +511,14 @@ class NoisyAcousticEngine:
         def _chunk_progress(msg: str, f: float) -> None:
             p(msg, 0.10 + f * 0.90)
 
+        def _guarded_chunk(chunk: np.ndarray) -> np.ndarray:
+            return _run_with_min_length(chunk, N_FFT, process_chunk)
+
         stats = _stream_disk_to_disk(
             main_path=main_path,
             out_path=out_path,
             sr=sr,
-            process_chunk=process_chunk,
+            process_chunk=_guarded_chunk,
             chunk_sec=chunk_sec,
             overlap_sec=overlap_sec,
             start_sec=start_sec,

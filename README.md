@@ -99,7 +99,8 @@ zout
 | `[3]` / `[4]` | Adjust Strength & Max Attenuation Cap |
 | `[F]` | Toggle DeepFilterNet3 Polish (`ON` / `OFF`) |
 | `[A]` | Toggle Forensic Audit sidecar (`.json` manifest) |
-| `[O]` | Set custom output path |
+| `[O]` | Set custom output file or batch output directory |
+| `[D]` | Runtime dependency & engine diagnostics |
 | `[P]` | Play reference noise / Processed output |
 | `[p]` | Play main subject recording |
 | `[Space]` | Stop playback |
@@ -165,12 +166,15 @@ zout --check-deps
 | `-t, --role [noisy\|clean]` | `noisy` = remove it; `clean` = keep it |
 | `-s, --strength 0-1` | Processing strength (default 0.75) |
 | `-a, --atten-db DB` | Max attenuation cap in dB (default 24; ≥60 = uncapped) |
-| `--polish [auto\|on\|off]` | DeepFilterNet3 speech polish (requires deepfilternet-slim) |
+| `--polish [auto\|on\|off]` | DeepFilterNet3 speech polish (`deepfilternet-slim` or `deepfilter-stream`) |
+| `--chunk-duration SEC` | Streaming chunk window in seconds (default 60.0) |
+| `--overlap-duration SEC` | Streaming raised-cosine overlap duration in seconds (default 2.0) |
 | `-o, --out FILE` | Output path (default: `<main>_zout.wav`) |
 | `-q, --quiet` | No progress bar; prints only the output path |
 | `--start TIME` | Start offset: seconds, `mm:ss`, or `hh:mm:ss` |
 | `--end TIME` | End offset: seconds, `mm:ss`, or `hh:mm:ss` |
 | `--audit` | Generate forensic JSON audit manifest sidecar |
+| `--audit-path FILE` | Explicit path for forensic JSON audit manifest (implies `--audit`) |
 | `-b, --batch DIR` | Process entire directory of audio files |
 | `--out-dir DIR` | Output directory for batch results (default: `<batch>/processed/`) |
 | `--auto-noise` | Scan `--main` for speech-free noise sections and use as reference |
@@ -237,14 +241,14 @@ zout -r alice_3sec.wav -m two_hour_recording.wav -t clean -s 0.75 -o alice_isola
 ## Testing
 
 ```bash
-# Run the full test suite (requires noisereduce)
-pytest tests/test_zout.py tests/test_e2e.py -v
+# Run the full repository test suite
+pytest tests/ -v
 
 # Check which features are available before running
 zout --check-deps
 ```
 
-Current test status: **120/125 passing** (5 blocked by voxlock dependency).
+Current test status: **275 unit, E2E, Tier-5, M4 hardening & stress tests passing** (see [TEST_READY.md](TEST_READY.md)).
 
 ---
 
@@ -269,7 +273,7 @@ Current test status: **120/125 passing** (5 blocked by voxlock dependency).
                                   |
                      Adaptive Leak Mask Blending
                                   |
-                       EBU R128 Peak Limiting
+                      -1 dBFS Peak Limiting
                                   |
                         Clean Output Audio
 ```

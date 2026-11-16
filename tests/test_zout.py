@@ -1145,3 +1145,166 @@ def test_kl_nmf_empty_matrix_guard():
     assert H_out.shape == H.shape
     assert np.isfinite(W_out).all()
     assert np.isfinite(H_out).all()
+
+
+def test_streaming_trailing_chunk_under_2048_samples(tmp_path):
+    """Verify streaming and engine guard trailing chunks and short arrays < N_FFT (2048)."""
+    from zout.engines.noisy_engine import NoisyAcousticEngine
+
+    ref_file = tmp_path / "ref.wav"
+    sf.write(ref_file, hum(0.5), SR)
+
+    main_file = tmp_path / "tail128.wav"
+    sig = speechlike(1.0) + hum(1.0) * 0.4
+    sig_plus_tail = np.concatenate([sig, np.ones(128, dtype=np.float32) * 0.05])
+    sf.write(main_file, sig_plus_tail, SR)
+
+    out_file = tmp_path / "out_tail.wav"
+    cfg = JobConfig(
+        ref_file, ReferenceRole.NOISY, main_file, 0.75, 24.0, out_file,
+        polish=False, chunk_duration=1.0, overlap_duration=0.0,
+    )
+    res = run_job(cfg)
+    assert res is not None and res.output.is_file()
+    out_data, _ = sf.read(str(res.output), dtype="float32")
+    assert len(out_data) == len(sig_plus_tail)
+
+    # Also verify direct NoisyAcousticEngine.run handles ultra-short ref/main (< 2048 samples)
+    short_ref = hum(0.5)[:256]
+    short_main = speechlike(0.5)[:160]
+    est, _ = NoisyAcousticEngine().run(short_ref, short_main, SR, 0.75, 24.0, polish=False)
+    assert len(est) == 160
+
+
+def test_streaming_non_native_single_ffmpeg_pipe(tmp_path, monkeypatch):
+    """Verify _stream_disk_to_disk opens only 1 persistent ffmpeg pipe across multi-chunk MP3s."""
+    from unittest.mock import MagicMock
+    from zout.audio.io import AudioInfo
+    import zout.engines.noisy_engine as ne
+
+    fake_mp3 = tmp_path / "long_audio.mp3"
+    fake_mp3.write_bytes(b"ID3" + b"\x00" * 256)
+    out_wav = tmp_path / "out.wav"
+
+    # 12 seconds @ 48kHz = 3 chunks when MAX_SAMPLES_PER_CHUNK=240_000 (5s)
+    monkeypatch.setattr(ne, "get_audio_info", lambda p: AudioInfo(12.0, 48000, 2, frames=12 * 48000))
+    open_calls = []
+
+    class FakeProc:
+        def __init__(self, *args, **kwargs):
+            open_calls.append(args)
+            self.stdout = MagicMock()
+            self.stderr = MagicMock()
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(ne, "open_ffmpeg_pcm_stream", lambda *a, **kw: FakeProc(*a, **kw))
+    monkeypatch.setattr(ne, "read_pcm_frames", lambda stream, n, channels=1: np.zeros(n, dtype=np.float32))
+
+    stats = ne._stream_disk_to_disk(
+        main_path=fake_mp3,
+        out_path=out_wav,
+        sr=48000,
+        process_chunk=lambda x: x,
+        chunk_sec=5.0,
+        overlap_sec=1.0,
+    )
+    assert len(open_calls) == 1, f"Expected 1 persistent ffmpeg pipe, got {len(open_calls)}"
+    assert stats["samples_written"] == 12 * 48000
+
+
+def test_extract_noise_profile_from_file_sliced_and_streaming(tmp_path, monkeypatch):
+    """Verify extract_noise_profile_from_file honors [start_sec, end_sec] and streams >180s files."""
+    from zout.audio.io import AudioInfo
+    import zout.audio.noise_extractor as nx
+
+    wav = tmp_path / "mix.wav"
+    # 0-2s: loud speech, 2-6s: pure room hum noise
+    speech = speechlike(2.0)
+    room = hum(4.0) * 0.25
+    sf.write(wav, np.concatenate([speech, room]), SR)
+
+    res = nx.extract_noise_profile_from_file(wav, n_chunks=2, chunk_sec=1.0, mode="fast", start_sec=2.0, end_sec=6.0)
+    assert len(res.audio) > 0
+    assert all(2.0 <= st < en <= 6.01 for st, en in res.chunks)
+
+    # Verify streaming branch (>180s) triggers without load_audio
+    monkeypatch.setattr(nx, "get_audio_info", lambda p: AudioInfo(300.0, SR, 1, frames=300 * SR))
+    monkeypatch.setattr(nx, "load_audio", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Full load not allowed")))
+    blocks = [hum(5.0) * 0.2, hum(5.0) * 0.2]
+    monkeypatch.setattr(nx, "iter_audio_chunks", lambda *a, **k: iter([(b, SR) for b in blocks]))
+    stream_res = nx.extract_noise_profile_from_file(wav, n_chunks=2, chunk_sec=1.5, mode="fast")
+    assert len(stream_res.audio) > SR
+
+
+def test_player_play_pair_slicing_and_preview_cap(tmp_path):
+    """Verify AudioPlayer.play_pair supports orig_start_sec/orig_end_sec and max_duration_sec."""
+    from zout.audio.player import AudioPlayer
+
+    orig = tmp_path / "orig.wav"
+    proc = tmp_path / "proc.wav"
+    sf.write(orig, speechlike(4.0), SR)
+    sf.write(proc, speechlike(1.5), SR)
+
+    p = AudioPlayer(force_headless=True)
+    ok = p.play_pair(orig, proc, start_with="B", orig_start_sec=1.5, orig_end_sec=3.0, max_duration_sec=0.5)
+    assert ok
+    assert p.duration == pytest.approx(0.5, abs=0.02)
+    p.stop()
+
+
+def test_format_duration_hhmmss_and_audio_info():
+    """Verify format_duration switches to HH:MM:SS for durations >= 1 hour."""
+    from zout.audio.io import AudioInfo, format_duration
+
+    assert format_duration(65.0) == "01:05"
+    assert format_duration(3661.0) == "01:01:01"
+    ai = AudioInfo(duration=16087.5, samplerate=48000, channels=2, frames=16087 * 48000)
+    assert ai.short().startswith("04:28:08 |")
+
+
+def test_cli_audit_path_and_noise_validation(tmp_path):
+    """Verify --audit-path, --noise-chunks, and --noise-len validation in CLI parser."""
+    from zout.app import _build_parser, _validate
+
+    ap = _build_parser()
+    ref = tmp_path / "r.wav"
+    main = tmp_path / "m.wav"
+    ref.write_bytes(b"0")
+    main.write_bytes(b"0")
+
+    args = ap.parse_args(["-r", str(ref), "-m", str(main), "-t", "noisy", "--audit-path", "custom/audit.json"])
+    _validate(ap, args)
+    assert args.audit_path == "custom/audit.json"
+
+    bad_chunks = ap.parse_args(["-m", str(main), "--auto-noise", "--noise-chunks", "0"])
+    with pytest.raises(SystemExit):
+        _validate(ap, bad_chunks)
+
+    bad_len = ap.parse_args(["-m", str(main), "--auto-noise", "--noise-len", "0.1"])
+    with pytest.raises(SystemExit):
+        _validate(ap, bad_len)
+
+
+def test_pipeline_records_audit_error_on_manifest_failure(tmp_path, monkeypatch):
+    """Verify audit manifest generation errors are recorded in Result.notes['audit_error']."""
+    ref = tmp_path / "ref.wav"
+    main = tmp_path / "main.wav"
+    out = tmp_path / "out.wav"
+    sf.write(ref, hum(1.0), SR)
+    sf.write(main, speechlike(1.0) + hum(1.0) * 0.4, SR)
+
+    import zout.audio.audit as za
+    monkeypatch.setattr(za, "generate_audit_manifest", lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full")))
+
+    cfg = JobConfig(ref, ReferenceRole.NOISY, main, 0.75, 24.0, out, polish=False, audit=True)
+    res = run_job(cfg)
+    assert res is not None
+    assert "disk full" in res.notes.get("audit_error", "")
