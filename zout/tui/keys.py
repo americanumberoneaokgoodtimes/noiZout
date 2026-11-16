@@ -67,6 +67,9 @@ def read_key(timeout: float | None = None) -> Key | None:
                 import select
                 if select.select([sys.stdin], [], [], 0.05)[0]:
                     seq = sys.stdin.read(2)
+                    if seq in ("[5", "[6", "[1", "[2", "[3", "[4", "[7", "[8"):
+                        if select.select([sys.stdin], [], [], 0.01)[0]:
+                            sys.stdin.read(1)
                     m = {
                         "[A": "up", "[B": "down", "[C": "right", "[D": "left",
                         "[H": "home", "[F": "end", "[5": "pgup", "[6": "pgdn",

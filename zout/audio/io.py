@@ -68,7 +68,7 @@ def open_ffmpeg_pcm_stream(
         "-f", "f32le", "-acodec", "pcm_f32le",
         "-ar", str(int(sr)), "-ac", str(int(channels)), "-",
     ])
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
 def close_process_quietly(proc: subprocess.Popen[bytes] | None) -> None:
@@ -263,7 +263,10 @@ def get_audio_info(path: Path | str) -> AudioInfo:
     if p.stat().st_size == 0:
         raise RuntimeError(f"Audio file is empty: {p}")
     if p.suffix.lower() in NATIVE_EXTENSIONS:
-        i = sf.info(str(p))
+        try:
+            i = sf.info(str(p))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read audio metadata for {p.name}: {exc}") from exc
         return AudioInfo(i.duration, i.samplerate, i.channels, frames=i.frames)
     info = probe_audio(p)
     if info is None or info.samplerate <= 0 or info.duration <= 0:

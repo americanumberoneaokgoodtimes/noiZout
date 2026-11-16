@@ -579,6 +579,9 @@ def prompt_timeline_range(console: Console, cfg: JobConfig, theme: themes.Theme 
         except Exception as ex:
             err_msg = f"Invalid end time: {ex}"
 
+        if not err_msg and e_val is not None and e_val <= 0:
+            err_msg = "End time must be greater than 00:00"
+
         if not err_msg and s_val is not None and e_val is not None:
             if s_val >= e_val:
                 err_msg = f"Start time ({s_val:.1f}s) must be strictly before end time ({e_val:.1f}s)"

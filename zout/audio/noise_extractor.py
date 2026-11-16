@@ -341,6 +341,8 @@ def extract_noise_profile(
     # Load VAD model once — reused across all scan attempts
     p("Loading VAD model...", 0.02)
     vad_model, get_timestamps = _load_vad_model()
+    if cancel_event is not None and cancel_event.is_set():
+        raise InterruptedError("Cancelled")
     if vad_model is None:
         warnings.append("Silero VAD unavailable; using energy-stationarity noise detection only.")
 
@@ -511,6 +513,8 @@ def extract_noise_profile_from_file(
 
     p("Loading VAD model...", 0.02)
     vad_model, get_timestamps = _load_vad_model()
+    if cancel_event is not None and cancel_event.is_set():
+        raise InterruptedError("Cancelled")
     if vad_model is None:
         warnings.append("Silero VAD unavailable; using energy-stationarity noise detection only.")
 

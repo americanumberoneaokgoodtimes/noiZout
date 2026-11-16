@@ -363,7 +363,10 @@ def test_auto_noise_candidate_scan_length_capping(monkeypatch):
         monkeypatch.setattr("zout.audio.noise_extractor.load_audio", forbid_full_load)
         monkeypatch.setattr("zout.audio.noise_extractor.iter_audio_chunks", fake_stream)
         monkeypatch.setattr("zout.tui.screens.read_key", lambda: Key("enter"))
-        monkeypatch.setattr("zout.tui.screens.poll_key", lambda timeout=0.05: Key("esc", "\x1b"))
+        monkeypatch.setattr(
+            "zout.tui.screens.poll_key",
+            lambda timeout=0.05: Key("esc", "\x1b") if streamed_chunk_secs else None,
+        )
 
         cfg = JobConfig(main=main_f)
         res = prompt_auto_noise(Console(record=True), cfg)
@@ -720,3 +723,88 @@ def test_cli_max_chunk_samples_and_noise_scan_flags():
     args = ap.parse_args(["--auto-noise", "-m", __file__, "--noise-scan", "sampled", "--max-chunk-samples", "480000"])
     assert args.noise_scan == "sampled"
     assert args.max_chunk_samples == 480000
+
+
+# ===========================================================================
+# 23. Gate Verification Regression Fixes
+# ===========================================================================
+
+def test_run_batch_propagates_max_chunk_samples(monkeypatch):
+    """Verify run_batch forwards cfg.max_chunk_samples to per-item JobConfig."""
+    from zout import pipeline
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        batch_dir = root / "batch"
+        batch_dir.mkdir()
+        out_dir = root / "out"
+        ref_f = root / "ref.wav"
+        sf.write(ref_f, np.zeros(16000, dtype=np.float32), 16000)
+        sf.write(batch_dir / "item.wav", np.zeros(16000, dtype=np.float32), 16000)
+
+        seen_caps: list[int] = []
+
+        def fake_run_job(item_cfg, progress=None, cancel_token=None):
+            seen_caps.append(item_cfg.max_chunk_samples)
+            return pipeline.Result(item_cfg.output, 0.1, -20.0, -30.0, 10.0)
+
+        monkeypatch.setattr(pipeline, "run_job", fake_run_job)
+        cfg = JobConfig(
+            reference=ref_f,
+            role=ReferenceRole.NOISY,
+            batch_dir=batch_dir,
+            out_dir=out_dir,
+            max_chunk_samples=65536,
+        )
+        res = pipeline.run_batch(cfg)
+        assert res is not None
+        assert seen_caps == [65536]
+
+
+def test_ref_length_guard_uses_ref_sr_and_preserves_existing_output():
+    """Verify 0.5s@8kHz ref (4000 samples) works with 48kHz main, and pre-flight error preserves existing output."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        ref_8k = root / "ref_8k.wav"
+        main_48k = root / "main_48k.wav"
+        out_f = root / "existing_out.wav"
+
+        rng = np.random.default_rng(11)
+        sf.write(ref_8k, (rng.standard_normal(4000) * 0.05).astype(np.float32), 8000)
+        sf.write(main_48k, (rng.standard_normal(48000 * 2) * 0.1).astype(np.float32), 48000)
+
+        cfg = JobConfig(
+            reference=ref_8k,
+            role=ReferenceRole.NOISY,
+            main=main_48k,
+            output=out_f,
+            polish=False,
+        )
+        res = run_job(cfg)
+        assert res is not None and out_f.is_file()
+        orig_bytes = out_f.read_bytes()
+
+        # Now trigger a pre-flight error with a too-short ref: existing out_f must remain intact
+        short_ref = root / "too_short.wav"
+        sf.write(short_ref, np.zeros(100, dtype=np.float32), 48000)
+        bad_cfg = JobConfig(
+            reference=short_ref,
+            role=ReferenceRole.NOISY,
+            main=main_48k,
+            output=out_f,
+            polish=False,
+        )
+        with pytest.raises(ValueError, match="reference recording is too short"):
+            run_job(bad_cfg)
+        assert out_f.is_file() and out_f.read_bytes() == orig_bytes
+
+
+def test_get_audio_info_corrupt_native_raises_runtime_error():
+    """Verify get_audio_info wraps soundfile errors on corrupt native files as RuntimeError."""
+    from zout.audio.io import get_audio_info
+
+    with tempfile.TemporaryDirectory() as td:
+        corrupt = Path(td) / "corrupt.wav"
+        corrupt.write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt_corrupt_bytes")
+        with pytest.raises(RuntimeError, match="Failed to read audio metadata"):
+            get_audio_info(corrupt)

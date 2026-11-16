@@ -62,7 +62,7 @@ def _cli(args) -> int:
                 scan_mode=scan_mode,
             )
         save_path = Path(args.save_noise) if args.save_noise else main_path.with_name(main_path.stem + "_noise_profile.wav")
-        save_audio(save_path, noise_res.audio, noise_res.sr)
+        save_path = save_audio(save_path, noise_res.audio, noise_res.sr)
         ref_path = save_path
         role = ReferenceRole.NOISY
         if not args.quiet:

@@ -37,10 +37,11 @@ class Result:
     audit_path: Path | None = None
 
 
-def _cleanup_partial(path: Path | None) -> None:
+def _cleanup_partial(path: Path | None, include_output: bool = True) -> None:
     """Safely unlink partially written output and temporary buffer files."""
-    if path is not None:
-        for p in (path, path.with_suffix(".json")):
+    if path is not None and include_output:
+        audit_candidate = path.with_name(f"{path.stem}_audit.json")
+        for p in (path, path.with_suffix(".json"), audit_candidate):
             if p.exists():
                 try:
                     p.unlink()
@@ -108,11 +109,10 @@ def run_streaming(
 
     p("Loading reference", 0.0)
     if cfg.is_cancelled():
-        _cleanup_partial(out_path)
         return None
 
     ref, ref_sr = load_audio(cfg.reference)
-    if len(ref) < max(2048, sr // 4):
+    if len(ref) < max(2048, ref_sr // 4):
         raise ValueError("reference recording is too short")
 
     def sub(msg: str, f: float) -> None:
@@ -174,7 +174,7 @@ def run_streaming(
     audit_sidecar: Path | None = None
     if cfg.audit:
         if cfg.is_cancelled():
-            _cleanup_partial(out_path)
+            _cleanup_partial(resolved_out_path)
             return None
         try:
             from .audio.audit import generate_audit_manifest
@@ -289,6 +289,7 @@ def run_batch(
             overlap_duration=cfg.overlap_duration,
             audit=cfg.audit,
             cancel_event=cfg.cancel_event,
+            max_chunk_samples=cfg.max_chunk_samples,
         )
 
         try:
@@ -356,7 +357,7 @@ def run_job(
     file_dur = info.duration
     sr = info.samplerate
     st = cfg.start_sec or 0.0
-    en = cfg.end_sec or file_dur
+    en = min(file_dur, cfg.end_sec) if cfg.end_sec is not None else file_dur
     eff_dur = max(0.0, en - st)
 
     if cfg.start_sec is not None and cfg.start_sec >= file_dur:
@@ -367,6 +368,7 @@ def run_job(
         raise ValueError(f"start_sec ({cfg.start_sec}) must be less than end_sec ({cfg.end_sec})")
 
     out_path = Path(cfg.output or cfg.default_output())
+    resolved_out_path = resolve_writable_output_path(out_path)
 
     # In-memory path stays <75MB up to ~480k samples (≈10s@48kHz, 5s@96kHz).
     # Streaming path is always bounded by MAX_SAMPLES_PER_CHUNK (240k) regardless of duration.
@@ -374,11 +376,13 @@ def run_job(
         int(eff_dur * sr) > 480_000
         or cfg.chunk_duration != 60.0
         or cfg.overlap_duration != 2.0
+        or (cfg.max_chunk_samples != 240_000 and int(eff_dur * sr) > cfg.max_chunk_samples)
     )
 
     if should_stream:
         return run_streaming(cfg, progress=progress, cancel_token=cancel_token)
 
+    output_started = False
     try:
         p = progress or (lambda *_: None)
         t0 = time.time()
@@ -389,7 +393,7 @@ def run_job(
 
         ref, ref_sr = load_audio(cfg.reference)
         main, sr = load_audio(cfg.main, start_sec=cfg.start_sec, end_sec=cfg.end_sec)
-        if len(ref) < max(2048, sr // 4):
+        if len(ref) < max(2048, ref_sr // 4):
             raise ValueError("reference recording is too short")
         if len(main) < sr // 4:
             raise ValueError("main recording is too short")
@@ -403,6 +407,7 @@ def run_job(
                 raise InterruptedError("Cancelled")
             p(msg, 0.05 + 0.9 * f)
 
+        output_started = True
         if cfg.role is ReferenceRole.NOISY:
             out, notes = NoisyAcousticEngine().run(
                 resample(ref, ref_sr, sr),
@@ -462,8 +467,8 @@ def run_job(
         return Result(path, time.time() - t0, in_rms, out_rms, supp_db, notes, audit_path=audit_sidecar)
 
     except InterruptedError:
-        _cleanup_partial(out_path)
+        _cleanup_partial(resolved_out_path, include_output=output_started)
         return None
     except Exception:
-        _cleanup_partial(out_path)
+        _cleanup_partial(resolved_out_path, include_output=output_started)
         raise
