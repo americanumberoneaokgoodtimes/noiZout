@@ -3,12 +3,15 @@ from __future__ import annotations
 import datetime
 import json
 import math
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import soundfile as sf
 import soxr
+
+from .io import NATIVE_EXTENSIONS, get_audio_info, load_audio
 
 if TYPE_CHECKING:
     from ..config import JobConfig
@@ -27,48 +30,104 @@ def sanitize_float(val: float | int | None, default: float = -120.0, ndigits: in
         return default
 
 
+def _iter_audio_chunks(
+    path: Path,
+    chunk_sec: float = 10.0,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+) -> Iterator[tuple[np.ndarray, int]]:
+    """Stream mono float32 chunks within [start_sec, end_sec] for native or ffmpeg formats."""
+    if not path.is_file() or path.stat().st_size == 0:
+        return
+    if path.suffix.lower() in NATIVE_EXTENSIONS:
+        with sf.SoundFile(str(path)) as snd:
+            file_sr = snd.samplerate
+            total_frames = snd.frames
+            start_f = max(0, int(round((start_sec or 0.0) * file_sr)))
+            end_f = min(total_frames, int(round(end_sec * file_sr))) if end_sec is not None else total_frames
+            if start_f >= end_f:
+                return
+            snd.seek(start_f)
+            chunk_frames = max(1024, int(chunk_sec * file_sr))
+            pos = start_f
+            while pos < end_f:
+                chunk = snd.read(min(chunk_frames, end_f - pos), dtype="float32", always_2d=True)
+                if len(chunk) == 0:
+                    break
+                pos += len(chunk)
+                yield chunk.mean(axis=1), file_sr
+    else:
+        info = get_audio_info(path)
+        t_start = max(0.0, float(start_sec or 0.0))
+        t_end = min(info.duration, float(end_sec)) if end_sec is not None else info.duration
+        if t_start >= t_end:
+            return
+        t = t_start
+        while t < t_end:
+            t_next = min(t_end, t + chunk_sec)
+            chunk, c_sr = load_audio(path, mono=True, start_sec=t, end_sec=t_next)
+            if len(chunk) > 0:
+                yield chunk, c_sr
+            if t_next <= t:
+                break
+            t = t_next
+
+
+def _slice_array(
+    audio: np.ndarray,
+    sr: int | None,
+    start_sec: float | None,
+    end_sec: float | None,
+) -> tuple[np.ndarray, int]:
+    """Convert array to mono float32 and apply optional [start_sec, end_sec] bounds."""
+    effective_sr = sr or 48000
+    mono = audio if audio.ndim == 1 else audio.mean(axis=1)
+    if start_sec is not None or end_sec is not None:
+        s = max(0, int(round((start_sec or 0.0) * effective_sr)))
+        e = min(len(mono), int(round(end_sec * effective_sr))) if end_sec is not None else len(mono)
+        mono = mono[s:e] if s < e else mono[:0]
+    return mono, effective_sr
+
+
 def compute_true_peak(
     audio: np.ndarray | Path | str,
     sr: int | None = None,
     oversample: int = 4,
     chunk_sec: float = 10.0,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
 ) -> float:
     """Compute ITU-R BS.1770 true-peak in dBFS with 4x oversampling via soxr.
 
     Streams in chunks to guarantee memory usage remains < 15MB even for multi-hour audio.
     Returns finite float in dBFS (clamped to -120.0 on silence or invalid signal).
     """
+    global_peak_linear = 0.0
     if isinstance(audio, (Path, str)):
         path = Path(audio)
         if not path.is_file():
             return -120.0
         try:
-            with sf.SoundFile(str(path)) as snd:
-                file_sr = snd.samplerate
-                chunk_frames = max(1024, int(chunk_sec * file_sr))
-                global_peak_linear = 0.0
-                while True:
-                    chunk = snd.read(chunk_frames, dtype="float32", always_2d=True)
-                    if len(chunk) == 0:
-                        break
-                    mono = chunk.mean(axis=1)
-                    resampled = soxr.resample(mono, file_sr, file_sr * oversample, quality="HQ")
-                    chunk_peak = float(np.max(np.abs(resampled))) if resampled.size else 0.0
-                    if chunk_peak > global_peak_linear:
-                        global_peak_linear = chunk_peak
-                if global_peak_linear <= 1e-6:
-                    return -120.0
-                return sanitize_float(20.0 * math.log10(global_peak_linear), default=-120.0, ndigits=2)
+            for mono, file_sr in _iter_audio_chunks(path, chunk_sec=chunk_sec, start_sec=start_sec, end_sec=end_sec):
+                if len(mono) == 0:
+                    continue
+                resampled = soxr.resample(mono, file_sr, file_sr * oversample, quality="HQ")
+                chunk_peak = float(np.max(np.abs(resampled))) if resampled.size else 0.0
+                if chunk_peak > global_peak_linear:
+                    global_peak_linear = chunk_peak
+            if global_peak_linear <= 1e-6:
+                return -120.0
+            return sanitize_float(20.0 * math.log10(global_peak_linear), default=-120.0, ndigits=2)
         except Exception:
             return -120.0
 
     if audio is None or (isinstance(audio, np.ndarray) and audio.size == 0):
         return -120.0
 
-    mono = audio if audio.ndim == 1 else audio.mean(axis=1)
-    effective_sr = sr or 48000
+    mono, effective_sr = _slice_array(audio, sr, start_sec, end_sec)
+    if len(mono) == 0:
+        return -120.0
     chunk_frames = max(1024, int(chunk_sec * effective_sr))
-    global_peak_linear = 0.0
 
     for i in range(0, len(mono), chunk_frames):
         chunk = mono[i : i + chunk_frames]
@@ -88,6 +147,8 @@ def compute_rms(
     audio: np.ndarray | Path | str,
     sr: int | None = None,
     chunk_sec: float = 10.0,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
 ) -> float:
     """Compute RMS level in dBFS.
 
@@ -99,31 +160,26 @@ def compute_rms(
         if not path.is_file():
             return -120.0
         try:
-            with sf.SoundFile(str(path)) as snd:
-                file_sr = snd.samplerate
-                chunk_frames = max(1024, int(chunk_sec * file_sr))
-                sum_sq = 0.0
-                total_samples = 0
-                while True:
-                    chunk = snd.read(chunk_frames, dtype="float32", always_2d=True)
-                    if len(chunk) == 0:
-                        break
-                    mono = chunk.mean(axis=1)
-                    sum_sq += float(np.sum(mono.astype(np.float64) ** 2))
-                    total_samples += len(mono)
-                if total_samples == 0:
-                    return -120.0
-                rms_lin = math.sqrt(sum_sq / total_samples)
-                if rms_lin <= 1e-6:
-                    return -120.0
-                return sanitize_float(20.0 * math.log10(rms_lin), default=-120.0, ndigits=2)
+            sum_sq = 0.0
+            total_samples = 0
+            for mono, _ in _iter_audio_chunks(path, chunk_sec=chunk_sec, start_sec=start_sec, end_sec=end_sec):
+                if len(mono) == 0:
+                    continue
+                sum_sq += float(np.sum(mono.astype(np.float64) ** 2))
+                total_samples += len(mono)
+            if total_samples == 0:
+                return -120.0
+            rms_lin = math.sqrt(sum_sq / total_samples)
+            if rms_lin <= 1e-6:
+                return -120.0
+            return sanitize_float(20.0 * math.log10(rms_lin), default=-120.0, ndigits=2)
         except Exception:
             return -120.0
 
     if audio is None or (isinstance(audio, np.ndarray) and audio.size == 0):
         return -120.0
 
-    mono = audio if audio.ndim == 1 else audio.mean(axis=1)
+    mono, _ = _slice_array(audio, sr, start_sec, end_sec)
     if len(mono) == 0:
         return -120.0
     sum_sq = float(np.sum(mono.astype(np.float64) ** 2))
@@ -136,26 +192,118 @@ def compute_rms(
 def extract_vad_intervals(
     audio: np.ndarray | Path | str,
     sr: int | None = None,
-    threshold: float = 0.10,
+    threshold: float = 0.15,
     min_speech_sec: float = 0.03,
     min_silence_sec: float = 0.35,
     chunk_sec: float = 10.0,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
 ) -> list[dict[str, float]]:
-    """Extract continuous speech intervals using silero_vad.
+    """Extract continuous speech intervals using pysilero_vad (ONNX) in streaming passes.
 
-    Args:
-        audio: Audio waveform as 1D/2D array or file Path.
-        sr: Sample rate if audio is array.
-        threshold: Speech probability threshold (default 0.10; silero_vad discriminates
-                   speech harmonics from noise/hum at this level while keeping false
-                   positives near zero on broadband Gaussian noise).
-        min_speech_sec: Minimum duration for a valid speech interval.
-        min_silence_sec: Bridge silence gaps shorter than this duration.
-        chunk_sec: Processing block size in seconds.
-
-    Returns:
-        List of dicts: [{"start": float, "end": float, "duration": float}]
+    Falls back to torch + silero_vad if pysilero_vad is unavailable.
     """
+    detector = None
+    try:
+        import pysilero_vad
+        detector = pysilero_vad.SileroVoiceActivityDetector()
+    except Exception:
+        detector = None
+
+    if detector is not None:
+        step = 512
+        frame_dur = step / 16000.0
+        active_frames: list[bool] = []
+        rem_16k = np.zeros(0, dtype=np.float32)
+
+        def _process_16k_stream(chunk_16k: np.ndarray) -> None:
+            nonlocal rem_16k
+            buf = np.concatenate([rem_16k, chunk_16k])
+            n_frames = len(buf) // step
+            for i in range(n_frames):
+                frame = buf[i * step : (i + 1) * step]
+                pcm = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                prob = float(detector(pcm))
+                active_frames.append(prob >= threshold)
+            rem_16k = buf[n_frames * step :]
+
+        try:
+            if isinstance(audio, (Path, str)):
+                path = Path(audio)
+                if not path.is_file():
+                    return []
+                for mono, c_sr in _iter_audio_chunks(path, chunk_sec=chunk_sec, start_sec=start_sec, end_sec=end_sec):
+                    if len(mono) == 0:
+                        continue
+                    c16 = (
+                        soxr.resample(mono, c_sr, 16000, quality="HQ").astype(np.float32)
+                        if c_sr != 16000
+                        else mono.astype(np.float32, copy=False)
+                    )
+                    _process_16k_stream(c16)
+            else:
+                if audio is None or (isinstance(audio, np.ndarray) and audio.size == 0):
+                    return []
+                mono, effective_sr = _slice_array(audio, sr or 16000, start_sec, end_sec)
+                if len(mono) == 0:
+                    return []
+                chunk_frames = max(1024, int(chunk_sec * effective_sr))
+                for i in range(0, len(mono), chunk_frames):
+                    sub = mono[i : i + chunk_frames]
+                    c16 = (
+                        soxr.resample(sub, effective_sr, 16000, quality="HQ").astype(np.float32)
+                        if effective_sr != 16000
+                        else sub.astype(np.float32, copy=False)
+                    )
+                    _process_16k_stream(c16)
+
+            if len(rem_16k) > 0:
+                frame = np.pad(rem_16k, (0, step - len(rem_16k)))
+                pcm = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                prob = float(detector(pcm))
+                active_frames.append(prob >= threshold)
+        except Exception:
+            return []
+
+        if not active_frames or not any(active_frames):
+            return []
+
+        raw_intervals: list[dict[str, float]] = []
+        in_speech = False
+        start_frame = 0
+        for idx, is_sp in enumerate(active_frames):
+            if is_sp and not in_speech:
+                in_speech = True
+                start_frame = idx
+            elif not is_sp and in_speech:
+                in_speech = False
+                raw_intervals.append({
+                    "start": round(start_frame * frame_dur, 3),
+                    "end": round(idx * frame_dur, 3),
+                    "duration": round((idx - start_frame) * frame_dur, 3),
+                })
+        if in_speech:
+            raw_intervals.append({
+                "start": round(start_frame * frame_dur, 3),
+                "end": round(len(active_frames) * frame_dur, 3),
+                "duration": round((len(active_frames) - start_frame) * frame_dur, 3),
+            })
+
+        merged: list[dict[str, float]] = []
+        for item in raw_intervals:
+            if not merged:
+                merged.append(dict(item))
+            else:
+                prev = merged[-1]
+                if item["start"] - prev["end"] <= min_silence_sec:
+                    prev["end"] = item["end"]
+                    prev["duration"] = round(prev["end"] - prev["start"], 3)
+                else:
+                    merged.append(dict(item))
+
+        return [i for i in merged if i["duration"] >= min_speech_sec]
+
+    # Optional fallback if torch + silero_vad happens to be installed instead of pysilero_vad
     try:
         import torch
         import silero_vad as _svad
@@ -163,29 +311,35 @@ def extract_vad_intervals(
     except Exception:
         return []
 
-    def _get_mono_16k(arr: np.ndarray, arr_sr: int) -> np.ndarray:
-        mono = arr if arr.ndim == 1 else arr.mean(axis=1)
-        if arr_sr != 16000:
-            mono = soxr.resample(mono, arr_sr, 16000, quality="HQ")
-        return mono.astype(np.float32)
-
+    chunks_16k: list[np.ndarray] = []
     if isinstance(audio, (Path, str)):
         path = Path(audio)
         if not path.is_file():
             return []
         try:
-            with sf.SoundFile(str(path)) as snd:
-                file_sr = snd.samplerate
-                data = snd.read(dtype="float32", always_2d=True)
-            mono_16k = _get_mono_16k(data, file_sr)
+            for mono, c_sr in _iter_audio_chunks(path, chunk_sec=chunk_sec, start_sec=start_sec, end_sec=end_sec):
+                c16 = (
+                    soxr.resample(mono, c_sr, 16000, quality="HQ").astype(np.float32)
+                    if c_sr != 16000
+                    else mono.astype(np.float32)
+                )
+                chunks_16k.append(c16)
         except Exception:
             return []
     else:
         if audio is None or (isinstance(audio, np.ndarray) and audio.size == 0):
             return []
-        effective_sr = sr or 16000
-        mono_16k = _get_mono_16k(audio, effective_sr)
+        mono, effective_sr = _slice_array(audio, sr or 16000, start_sec, end_sec)
+        if len(mono) > 0:
+            chunks_16k.append(
+                soxr.resample(mono, effective_sr, 16000, quality="HQ").astype(np.float32)
+                if effective_sr != 16000
+                else mono.astype(np.float32)
+            )
 
+    if not chunks_16k:
+        return []
+    mono_16k = np.concatenate(chunks_16k)
     if len(mono_16k) == 0:
         return []
 
@@ -243,7 +397,12 @@ def build_parameters_manifest(cfg: JobConfig) -> dict[str, Any]:
     }
 
 
-def _get_audio_duration(audio: np.ndarray | Path | str | None, sr: int | None = None) -> float:
+def _get_audio_duration(
+    audio: np.ndarray | Path | str | None,
+    sr: int | None = None,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+) -> float:
     """Helper to get audio duration in seconds safely."""
     if audio is None:
         return 0.0
@@ -251,15 +410,23 @@ def _get_audio_duration(audio: np.ndarray | Path | str | None, sr: int | None = 
         path = Path(audio)
         if path.is_file():
             try:
-                info = sf.info(str(path))
-                return float(info.duration)
+                dur = float(get_audio_info(path).duration)
+                if start_sec is not None or end_sec is not None:
+                    s = max(0.0, float(start_sec or 0.0))
+                    e = min(dur, float(end_sec)) if end_sec is not None else dur
+                    return max(0.0, e - s)
+                return dur
             except Exception:
                 return 0.0
         return 0.0
     if isinstance(audio, np.ndarray) and audio.size > 0:
         eff_sr = sr or 48000
-        mono_len = len(audio) if audio.ndim == 1 else len(audio)
-        return float(mono_len / eff_sr)
+        dur = float(len(audio) / eff_sr)
+        if start_sec is not None or end_sec is not None:
+            s = max(0.0, float(start_sec or 0.0))
+            e = min(dur, float(end_sec)) if end_sec is not None else dur
+            return max(0.0, e - s)
+        return dur
     return 0.0
 
 
@@ -332,14 +499,17 @@ def generate_audit_manifest(
     # 2. Resolve input and output sources for metrics
     in_src = input_audio if input_audio is not None else cfg.main
     out_src = output_audio if output_audio is not None else out_target
+    # Slice file inputs to [cfg.start_sec, cfg.end_sec] (in-memory arrays from pipeline are already sliced)
+    in_start = cfg.start_sec if isinstance(in_src, (Path, str)) else None
+    in_end = cfg.end_sec if isinstance(in_src, (Path, str)) else None
 
     # 3. Compute True-Peak levels (4x oversampled with soxr)
-    in_tp = compute_true_peak(in_src, sr=sr)
+    in_tp = compute_true_peak(in_src, sr=sr, start_sec=in_start, end_sec=in_end)
     out_tp = compute_true_peak(out_src, sr=sr)
 
     # 4. Compute RMS levels in dBFS
     if in_rms is None:
-        in_rms = compute_rms(in_src, sr=sr)
+        in_rms = compute_rms(in_src, sr=sr, start_sec=in_start, end_sec=in_end)
     else:
         in_rms = sanitize_float(in_rms, default=-120.0, ndigits=2)
 
@@ -355,12 +525,20 @@ def generate_audit_manifest(
         suppression_db = sanitize_float(suppression_db, default=0.0, ndigits=2)
 
     # 6. Continuous VAD speech intervals (analyzed on input audio — documents what speech
-    #    was present in the original recording; falls back to output if input unavailable)
-    vad_target = in_src if in_src is not None else out_src
-    vad_intervals = extract_vad_intervals(vad_target, sr=sr)
+    #    was present in the original recording; falls back to output if input unavailable/empty)
+    if in_src is not None:
+        vad_intervals = extract_vad_intervals(in_src, sr=sr, start_sec=in_start, end_sec=in_end)
+        if not vad_intervals and out_src is not None:
+            vad_intervals = extract_vad_intervals(out_src, sr=sr)
+    elif out_src is not None:
+        vad_intervals = extract_vad_intervals(out_src, sr=sr)
+    else:
+        vad_intervals = []
 
     # 7. Compute speech summary
-    total_dur = _get_audio_duration(out_src, sr=sr) or _get_audio_duration(in_src, sr=sr)
+    total_dur = _get_audio_duration(out_src, sr=sr) or _get_audio_duration(
+        in_src, sr=sr, start_sec=in_start, end_sec=in_end
+    )
     speech_summary = compute_speech_summary(vad_intervals, total_dur)
 
     # 8. Assemble manifest dictionary matching full schema

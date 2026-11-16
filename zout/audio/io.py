@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import soxr
+from scipy.ndimage import maximum_filter1d, uniform_filter1d
 
 from ..config import NATIVE_EXTENSIONS
 
@@ -21,6 +22,7 @@ class AudioInfo:
     duration: float
     samplerate: int
     channels: int
+    frames: int = 0
 
     def short(self) -> str:
         m, s = divmod(int(round(self.duration)), 60)
@@ -126,9 +128,12 @@ def parse_time_spec(val: str | float | int | None) -> float | None:  # noqa: PYI
 
 def probe_audio(path: Path) -> AudioInfo | None:
     try:
+        path = Path(path)
+        if not path.is_file() or path.stat().st_size == 0:
+            return None
         if path.suffix.lower() in NATIVE_EXTENSIONS:
             i = sf.info(str(path))
-            return AudioInfo(i.duration, i.samplerate, i.channels)
+            return AudioInfo(i.duration, i.samplerate, i.channels, frames=i.frames)
         ffprobe = shutil.which("ffprobe")
         if not ffprobe:
             return None
@@ -137,9 +142,29 @@ def probe_audio(path: Path) -> AudioInfo | None:
              "stream=sample_rate,channels:format=duration", "-of", "default=nw=1", str(path)],
             capture_output=True, text=True, timeout=10, check=False).stdout
         d = dict(l.split("=", 1) for l in out.split() if "=" in l)
-        return AudioInfo(float(d.get("duration", 0)), int(d.get("sample_rate", 0)), int(d.get("channels", 1)))
+        dur = float(d.get("duration", 0))
+        # load_audio decodes non-native formats via ffmpeg at 48 kHz (-ar 48000),
+        # so report 48000 as the effective rate rather than the native codec rate.
+        sr = 48000
+        return AudioInfo(dur, sr, int(d.get("channels", 1)), frames=int(round(dur * sr)))
     except Exception:
         return None
+
+
+def get_audio_info(path: Path | str) -> AudioInfo:
+    """Return AudioInfo for both native soundfile formats and ffmpeg-backed formats."""
+    p = Path(path)
+    if not p.is_file():
+        raise RuntimeError(f"Audio file not found: {p}")
+    if p.stat().st_size == 0:
+        raise RuntimeError(f"Audio file is empty: {p}")
+    if p.suffix.lower() in NATIVE_EXTENSIONS:
+        i = sf.info(str(p))
+        return AudioInfo(i.duration, i.samplerate, i.channels, frames=i.frames)
+    info = probe_audio(p)
+    if info is None or info.samplerate <= 0 or info.duration <= 0:
+        raise RuntimeError(f"Failed to probe audio metadata for {p.name} (ensure ffprobe/ffmpeg is installed)")
+    return info
 
 
 def load_audio(
@@ -305,6 +330,30 @@ def peak_limit(x: np.ndarray, ceiling_db: float = -1.0) -> np.ndarray:
     ceil = 10 ** (ceiling_db / 20)
     p = float(np.max(np.abs(x))) if x.size else 0.0
     return x * (ceil / p) if p > ceil else x
+
+
+def local_peak_limit(
+    x: np.ndarray,
+    ceiling_db: float = -1.0,
+    window_samples: int = 1024,
+) -> np.ndarray:
+    """Apply a smoothed local sliding-window peak limiter without attenuating the entire chunk.
+
+    Returns ``x`` unmodified when ``max(abs(x)) <= ceiling``.
+    """
+    ceil = float(10 ** (ceiling_db / 20.0))
+    if x.size == 0:
+        return x
+    peak = float(np.max(np.abs(x)))
+    if peak <= ceil:
+        return x
+    win = max(64, int(window_samples))
+    local_env = maximum_filter1d(np.abs(x).astype(np.float32), size=win, mode="nearest")
+    gain = np.where(local_env > ceil, ceil / np.maximum(local_env, 1e-12), 1.0).astype(np.float32)
+    smooth_gain = uniform_filter1d(gain, size=max(16, win // 4), mode="nearest")
+    effective_gain = np.minimum(gain, smooth_gain)
+    limited = (x * effective_gain).astype(np.float32)
+    return np.clip(limited, -ceil, ceil)
 
 
 def prepare_clean_enrollment(x: np.ndarray, sr: int, min_sec: float = 3.2) -> tuple[np.ndarray, float]:

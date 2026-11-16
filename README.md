@@ -10,7 +10,7 @@ noiZout (`zout`) is a terminal-based audio differentiation engine built with Pyt
 
 - **NOISY Reference Mode**: Learn room noise, HVAC hum, mic gain hiss, or non-stationary noise patterns from a reference sample and subtract them from the main recording using supervised KL-NMF and adaptive spectral gating.
 - **CLEAN Reference Mode**: Conditioned on even a short (1-3 second) clean utterance, isolats and restores the target speaker's voice using VoxLock Target-Speaker Extraction (TSE), retaining natural vocal harmonics while rejecting background noise and competing voices.
-- **Automatic Room Noise Extraction (`[A]`)**: Automatically scans recordings for candidate speech-free room noise sections with lowest SNR. Rigorously rejects voice fragments using Silero VAD v5 ($\le 0.06$ probability threshold) and crossfades sections into a pure reference profile.
+- **Automatic Room Noise Extraction (`[N]`)**: Automatically scans recordings for candidate speech-free room noise sections with lowest SNR. Rigorously rejects voice fragments using Silero VAD ($\le 0.06$ probability threshold in Deep mode) and crossfades sections into a pure reference profile.
 - **In-Terminal Audio Playback**: Listen to audio directly from the terminal without leaving the app:
   - `[P]` — Play noise reference / processed result
   - `[p]` — Play original main recording

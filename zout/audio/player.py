@@ -339,7 +339,10 @@ class AudioPlayer:
             return ""
         with self._lock:
             dur = self._duration
-            raw_elapsed = time.time() - self._start_time
+            if self._audio_a is not None and self._sr > 0 and self._sample_index > 0:
+                raw_elapsed = self._sample_index / float(self._sr)
+            else:
+                raw_elapsed = time.time() - self._start_time
             elapsed = min(dur, max(0.0, raw_elapsed)) if dur > 0 else max(0.0, raw_elapsed)
             if self._orig_path and self._proc_path and self._orig_path != self._proc_path:
                 trk = self._active_track

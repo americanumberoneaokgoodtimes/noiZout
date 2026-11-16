@@ -7,7 +7,7 @@ from pathlib import Path
 from rich.console import Console
 
 from . import __version__
-from .config import SUPPORTED_AUDIO_EXTENSIONS, JobConfig, ReferenceRole
+from .config import SUPPORTED_AUDIO_EXTENSIONS, JobConfig, ReferenceRole, collect_deps_status
 
 
 def _cli(args) -> int:
@@ -26,16 +26,31 @@ def _cli(args) -> int:
     out_dir = Path(args.out_dir) if getattr(args, "out_dir", None) else None
 
     if args.auto_noise and main_path:
+        size_mb = main_path.stat().st_size / 1_048_576
         if not args.quiet:
-            console.print(f"[cyan]Auto-extracting noise profile from:[/] {main_path.name}")
-        main_audio, sr = load_audio(main_path, mono=True)
-        noise_res = extract_noise_profile(
-            main_audio,
-            sr=sr,
-            n_chunks=args.noise_chunks,
-            chunk_sec=args.noise_len,
-            mode=args.noise_mode,
-        )
+            with Progress(console=console) as _pg:
+                _task = _pg.add_task(f"Loading audio ({size_mb:.0f} MB)...", total=100)
+                main_audio, sr = load_audio(main_path, mono=True)
+                dur_s = len(main_audio) / sr
+                _pg.update(_task, completed=8,
+                           description=f"Scanning {dur_s / 60:.1f} min for speech-free noise...")
+                noise_res = extract_noise_profile(
+                    main_audio,
+                    sr=sr,
+                    n_chunks=args.noise_chunks,
+                    chunk_sec=args.noise_len,
+                    mode=args.noise_mode,
+                    progress=lambda msg, f: _pg.update(_task, completed=8 + f * 92, description=msg),
+                )
+        else:
+            main_audio, sr = load_audio(main_path, mono=True)
+            noise_res = extract_noise_profile(
+                main_audio,
+                sr=sr,
+                n_chunks=args.noise_chunks,
+                chunk_sec=args.noise_len,
+                mode=args.noise_mode,
+            )
         save_path = Path(args.save_noise) if args.save_noise else main_path.with_name(main_path.stem + "_noise_profile.wav")
         save_audio(save_path, noise_res.audio, sr)
         ref_path = save_path
@@ -60,6 +75,8 @@ def _cli(args) -> int:
         polish=None if args.polish == "auto" else args.polish == "on",
         start_sec=start_sec,
         end_sec=end_sec,
+        chunk_duration=getattr(args, "chunk_duration", 60.0),
+        overlap_duration=getattr(args, "overlap_duration", 2.0),
         audit=audit,
         batch_dir=batch_dir,
         out_dir=out_dir,
@@ -116,12 +133,36 @@ def _interactive() -> int:
         while True:
             cur_th = themes.get_theme()
             console.clear()
-            console.print(screens.dashboard(cfg, msg, theme=cur_th))
-            msg = ""
-            k = screens.read_key()
-            if k is None or k.name != "char":
+            if player.is_playing():
+                k = None
+                with Live(screens.dashboard(cfg, msg, theme=cur_th),
+                          console=console, refresh_per_second=12, transient=True) as live:
+                    msg = ""
+                    while player.is_playing():
+                        live.update(screens.dashboard(cfg, msg, theme=themes.get_theme()))
+                        k = screens.poll_key(timeout=0.08)
+                        if k is not None:
+                            break
+                if k is None:
+                    console.clear()
+                    console.print(screens.dashboard(cfg, msg, theme=themes.get_theme()))
+                    k = screens.read_key()
+            else:
+                console.print(screens.dashboard(cfg, msg, theme=cur_th))
+                msg = ""
+                k = screens.read_key()
+
+            if k is None:
+                continue
+            if k.name == "space":
+                if player.is_playing():
+                    player.stop()
+                    msg = "Playback stopped."
+                continue
+            if k.name != "char":
                 continue
             c = k.char
+            cur_th = themes.get_theme()
             if c.lower() == "q":
                 return 0
             elif c == "1":
@@ -198,9 +239,10 @@ def _interactive() -> int:
                     msg = "Playback stopped."
             elif c.lower() == "o":
                 player.stop()
-                console.print("\nOutput path (blank = default): ", end="")
-                s = input().strip().strip('"')
-                cfg.output = Path(s) if s else None
+                screens.prompt_output_path(console, cfg, theme=cur_th)
+            elif c.lower() == "d":
+                player.stop()
+                screens.prompt_deps_check(console, theme=cur_th)
             elif c.lower() == "r":
                 player.stop()
                 if not cfg.ready():
@@ -221,8 +263,13 @@ def _interactive() -> int:
                             break
                     continue
                 else:
-                    # Auto-start A/B hot-swap playback with processed track B
-                    if cfg.main and res.output and res.output.is_file():
+                    # Auto-start A/B hot-swap playback with processed track B (single-file jobs only)
+                    has_pair = bool(
+                        not res.notes.get("batch")
+                        and cfg.main and cfg.main.is_file()
+                        and res.output and res.output.is_file()
+                    )
+                    if has_pair:
                         player.play_pair(cfg.main, res.output, start_with="B")
 
                     with Live(screens.result_card(res, player.status_text(), theme=cur_th),
@@ -233,19 +280,41 @@ def _interactive() -> int:
                             rk = screens.poll_key(timeout=0.08)
                             if rk is None:
                                 continue
-                            if rk.name == "tab":
+                            if rk.name == "tab" and has_pair and player.is_playing():
                                 player.toggle_ab()
                             elif rk.name == "space" or (rk.name == "char" and rk.char == " "):
                                 if player.is_playing():
                                     player.stop()
-                                else:
-                                    if cfg.main and res.output and res.output.is_file():
+                                elif has_pair:
+                                    player.play_pair(cfg.main, res.output, start_with="B")
+                            elif rk.name == "char" and rk.char == "P":
+                                if has_pair:
+                                    if player.is_playing():
+                                        if player.get_current_track() == "B":
+                                            player.stop()
+                                        else:
+                                            player.toggle_ab()
+                                    else:
                                         player.play_pair(cfg.main, res.output, start_with="B")
-                            elif rk.name == "char" and rk.char.upper() == "P":
-                                player.play(res.output, "Processed Output")
+                                elif res.output and res.output.is_file():
+                                    if player.is_playing():
+                                        player.stop()
+                                    else:
+                                        player.play(res.output, "Processed Output")
                             elif rk.name == "char" and rk.char == "p":
-                                if cfg.main and cfg.main.is_file():
-                                    player.play(cfg.main, "Main Recording")
+                                if has_pair:
+                                    if player.is_playing():
+                                        if player.get_current_track() == "A":
+                                            player.stop()
+                                        else:
+                                            player.toggle_ab()
+                                    else:
+                                        player.play_pair(cfg.main, res.output, start_with="A")
+                                elif cfg.main and cfg.main.is_file():
+                                    if player.is_playing():
+                                        player.stop()
+                                    else:
+                                        player.play(cfg.main, "Main Recording")
                             elif rk.name == "char" and rk.char.lower() == "c":
                                 themes.cycle_theme()
                             elif rk.name in ("enter", "esc"):
@@ -277,6 +346,10 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="max attenuation cap in dB, 6-60 (>=60 = uncapped, default 24)")
     ap.add_argument("--polish", choices=["auto", "on", "off"], default="auto",
                     help="DeepFilterNet3 speech polish (auto: on, off)")
+    ap.add_argument("--chunk-duration", type=float, default=60.0, metavar="SEC",
+                    help="streaming chunk duration in seconds (default 60.0)")
+    ap.add_argument("--overlap-duration", type=float, default=2.0, metavar="SEC",
+                    help="streaming raised-cosine overlap duration in seconds (default 2.0)")
     ap.add_argument("-o", "--out", metavar="FILE", help="output file (default: <main>_zout.wav)")
     ap.add_argument("-q", "--quiet", action="store_true", help="no progress bar; print only the output path")
     ap.add_argument("-V", "--version", action="version", version=f"zout {__version__}")
@@ -370,52 +443,27 @@ def _validate(ap: argparse.ArgumentParser, args) -> None:
         ap.error("--strength must be between 0 and 1")
     if not 6.0 <= args.atten_db:
         ap.error("--atten-db must be >= 6")
+    if getattr(args, "chunk_duration", 60.0) <= 0:
+        ap.error("--chunk-duration must be positive")
+    if getattr(args, "overlap_duration", 2.0) < 0:
+        ap.error("--overlap-duration cannot be negative")
+    if getattr(args, "overlap_duration", 2.0) >= getattr(args, "chunk_duration", 60.0):
+        ap.error("--overlap-duration must be strictly less than --chunk-duration")
 
 
 def _check_deps() -> int:
     """Print a feature-availability table and exit."""
-    import shutil
-
     console = Console()
-
-    def _chk(label: str, pkg: str, extra: str = "") -> None:
-        try:
-            __import__(pkg)
-            status = "[green]  OK [/]"
-        except ImportError:
-            status = "[red] MISSING [/]"
-        hint = f"  [dim]{extra}[/]" if extra else ""
-        console.print(f"  {status}  {label}{hint}")
-
-    console.print("[bold]noiZout runtime dependency check[/]\n")
-    console.print("[bold cyan]Audio processing[/]")
-    _chk("NOISY mode  (noisereduce spectral gating)", "noisereduce",
-         "pip install noisereduce")
-    _chk("CLEAN mode  (VoxLock speaker extraction)", "voxlock",
-         "pip install voxlock")
-    # Polish stage: try slim C runtime first, then public ONNX wheel
-    try:
-        import deepfilternet_slim  # noqa: F401
-        console.print("  [green]  OK [/]  Polish stage (deepfilternet-slim C runtime)  [dim]private package[/]")
-    except ImportError:
-        console.print("  [yellow] SLIM [/]  Polish stage (deepfilternet-slim C runtime)  [dim]not installed — see project docs[/]")
-    try:
-        import deepfilter_stream  # noqa: F401
-        console.print("  [green]  OK [/]  Polish stage (deepfilter-stream ONNX — public)  [dim]active fallback[/]")
-    except ImportError:
-        console.print("  [red] MISSING [/]  Polish stage (deepfilter-stream ONNX — public)  [dim]pip install deepfilter-stream[/]")
-
-    console.print("\n[bold cyan]Media format support[/]")
-    ffmpeg_ok = shutil.which("ffmpeg") is not None
-    ffprobe_ok = shutil.which("ffprobe") is not None
-    if ffmpeg_ok and ffprobe_ok:
-        console.print("  [green]  OK [/]  ffmpeg + ffprobe  [dim](MP3, M4A, AAC, etc.)[/]")
-    else:
-        missing = " + ".join(x for x, ok in [("ffmpeg", ffmpeg_ok), ("ffprobe", ffprobe_ok)] if not ok)
-        console.print(f"  [red] MISSING [/]  {missing}  [dim](MP3/M4A/AAC will fail to load — install ffmpeg)[/]")
-
-    console.print("\n[bold cyan]Playback[/]")
-    _chk("sounddevice (audio output)", "sounddevice", "pip install sounddevice")
+    console.print("[bold]noiZout runtime dependency check[/]")
+    last_section = None
+    for section, label, status, detail in collect_deps_status():
+        if section != last_section:
+            console.print(f"\n[bold cyan]{section}[/]")
+            last_section = section
+        color = "green" if status == "OK" else ("yellow" if status == "SLIM" else "red")
+        tag = f"[{color}]{status:^9}[/]"
+        hint = f"  [dim]{detail}[/]" if detail else ""
+        console.print(f"  {tag}  {label}{hint}")
     console.print()
     return 0
 

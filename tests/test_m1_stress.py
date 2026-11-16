@@ -134,8 +134,10 @@ def test_stress_sample_index_strictly_monotonic_across_toggles(audio_pair):
 
     player.stop()
 
-    assert toggle_count >= 10, f"Expected at least 10 toggles, got {toggle_count}"
-    assert len(observed_indices) >= 50, f"Expected >= 50 index samples, got {len(observed_indices)}"
+    # Windows timer resolution is ~15ms, so sleep(0.004) sleeps ~15ms actual.
+    # In 0.5s we get ~33 iterations, with toggle every 5th = ~6 toggles minimum.
+    assert toggle_count >= 4, f"Expected at least 4 toggles, got {toggle_count}"
+    assert len(observed_indices) >= 10, f"Expected >= 10 index samples, got {len(observed_indices)}"
 
     # Verification: monotonicity
     for i in range(1, len(observed_indices)):

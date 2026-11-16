@@ -129,3 +129,64 @@ class JobConfig:
 
     def is_cancelled(self) -> bool:
         return self.cancel_event is not None and self.cancel_event.is_set()
+
+
+def collect_deps_status() -> list[tuple[str, str, str, str]]:
+    """Return runtime dependency checks as (section, label, status_tag, detail)."""
+    import shutil
+
+    def _has_pkg(pkg: str) -> bool:
+        try:
+            __import__(pkg)
+            return True
+        except ImportError:
+            return False
+
+    rows: list[tuple[str, str, str, str]] = [
+        (
+            "Audio processing",
+            "NOISY mode (noisereduce spectral gating)",
+            "OK" if _has_pkg("noisereduce") else "MISSING",
+            "pip install noisereduce",
+        ),
+        (
+            "Audio processing",
+            "CLEAN mode (VoxLock speaker extraction)",
+            "OK" if _has_pkg("voxlock") else "MISSING",
+            "pip install voxlock",
+        ),
+        (
+            "Audio processing",
+            "Polish stage (deepfilternet-slim C runtime)",
+            "OK" if _has_pkg("deepfilternet_slim") else "SLIM",
+            "private package" if _has_pkg("deepfilternet_slim") else "not installed — optional C runtime",
+        ),
+        (
+            "Audio processing",
+            "Polish stage (deepfilter-stream ONNX)",
+            "OK" if _has_pkg("deepfilter_stream") else "MISSING",
+            "pip install deepfilter-stream",
+        ),
+        (
+            "Audio processing",
+            "Silero VAD (pysilero-vad auto-noise & audit)",
+            "OK" if _has_pkg("pysilero_vad") else "MISSING",
+            "pip install pysilero-vad",
+        ),
+    ]
+
+    ffmpeg_ok = shutil.which("ffmpeg") is not None
+    ffprobe_ok = shutil.which("ffprobe") is not None
+    if ffmpeg_ok and ffprobe_ok:
+        rows.append(("Media format support", "ffmpeg + ffprobe", "OK", "MP3, M4A, AAC, etc."))
+    else:
+        missing = " + ".join(x for x, ok in [("ffmpeg", ffmpeg_ok), ("ffprobe", ffprobe_ok)] if not ok)
+        rows.append(("Media format support", missing, "MISSING", "MP3/M4A/AAC will fail to load — install ffmpeg"))
+
+    rows.append((
+        "Playback",
+        "sounddevice (audio output)",
+        "OK" if _has_pkg("sounddevice") else "MISSING",
+        "pip install sounddevice",
+    ))
+    return rows

@@ -968,3 +968,180 @@ def test_cli_parser_m3_flags():
     assert args.start == "00:15"
     assert args.end == "01:45"
     assert args.audit is True
+
+
+def test_get_audio_info_native_and_non_native(tmp_path):
+    """Verify get_audio_info handles native WAV, real/mocked MP3, and raises on missing/empty files."""
+    from unittest.mock import patch
+    from zout.audio.io import AudioInfo, get_audio_info
+
+    wav_path = tmp_path / "sample.wav"
+    sf.write(wav_path, speechlike(1.5), SR)
+    info = get_audio_info(wav_path)
+    assert info.samplerate == SR
+    assert info.channels == 1
+    assert abs(info.duration - 1.5) < 0.05
+
+    empty_path = tmp_path / "empty.wav"
+    empty_path.write_bytes(b"")
+    with pytest.raises(RuntimeError, match="empty"):
+        get_audio_info(empty_path)
+
+    with pytest.raises(RuntimeError, match="not found"):
+        get_audio_info(tmp_path / "missing.mp3")
+
+    fake_mp3 = tmp_path / "clip.mp3"
+    fake_mp3.write_bytes(b"ID3dummy")
+    mock_info = AudioInfo(duration=4.2, samplerate=48000, channels=2, frames=201600)
+    with patch("zout.audio.io.probe_audio", return_value=mock_info):
+        mp3_info = get_audio_info(fake_mp3)
+        assert mp3_info.duration == pytest.approx(4.2)
+        assert mp3_info.samplerate == 48000
+
+
+def test_non_native_mp3_streaming_and_audit(tmp_path):
+    """Verify non-native MP3 audio runs cleanly through run_streaming and forensic audit."""
+    import shutil
+    import subprocess
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("ffmpeg/ffprobe required for MP3 integration test")
+
+    ref_wav = tmp_path / "ref.wav"
+    sf.write(ref_wav, hum(1.5), SR)
+
+    raw_wav = tmp_path / "src.wav"
+    sig = speechlike(3.0) + hum(3.0) * 0.6
+    sf.write(raw_wav, sig, SR)
+
+    mp3_path = tmp_path / "main.mp3"
+    proc = subprocess.run(
+        [shutil.which("ffmpeg"), "-y", "-v", "error", "-i", str(raw_wav), "-b:a", "128k", str(mp3_path)],
+        capture_output=True,
+    )
+    if proc.returncode != 0 or not mp3_path.is_file():
+        pytest.skip("ffmpeg could not encode test MP3")
+
+    out_wav = tmp_path / "out_mp3.wav"
+    cfg = JobConfig(
+        ref_wav, ReferenceRole.NOISY, mp3_path, 0.75, 24.0, out_wav,
+        polish=False, chunk_duration=1.5, overlap_duration=0.25, audit=True,
+    )
+    res = run_job(cfg)
+    assert res is not None
+    assert res.output.is_file()
+    assert res.audit_path is not None and res.audit_path.is_file()
+    out_data, out_sr = sf.read(str(res.output), dtype="float32")
+    assert out_sr == 48000
+    assert len(out_data) > 48000
+
+
+def test_local_peak_limit_preserves_quiet_and_clamps_spikes():
+    """Verify local_peak_limit preserves clean regions while clamping localized spikes to <= -1 dBFS."""
+    from zout.audio.io import local_peak_limit
+
+    quiet = (0.4 * np.sin(2 * np.pi * 440 * np.arange(8000) / SR)).astype(np.float32)
+    assert local_peak_limit(quiet) is quiet
+
+    sig = quiet.copy()
+    sig[4000:4050] = 1.5
+    limited = local_peak_limit(sig, ceiling_db=-1.0)
+    ceil = 10 ** (-1.0 / 20.0)
+    assert float(np.max(np.abs(limited))) <= ceil + 1e-6
+    # Regions far from the transient remain completely un-attenuated
+    assert float(np.max(np.abs(limited[:500] - quiet[:500]))) < 1e-6
+
+
+def test_audit_manifest_respects_file_range_slicing(tmp_path):
+    """Verify generate_audit_manifest limits file-based metrics & VAD to [cfg.start_sec, cfg.end_sec]."""
+    import json
+    from zout.audio.audit import generate_audit_manifest
+
+    # 0-2s: loud tone (~0 dBFS), 2-4s: quiet speech proxy (~-26 dBFS RMS)
+    s1 = (0.9 * np.sin(2 * np.pi * 200 * np.arange(2 * SR) / SR)).astype(np.float32)
+    s2 = speechlike(2.0) * 0.2
+    combined = np.concatenate([s1, s2])
+    main_wav = tmp_path / "sliced_input.wav"
+    out_wav = tmp_path / "sliced_out.wav"
+    sf.write(main_wav, combined, SR)
+    sf.write(out_wav, s2, SR)
+
+    cfg = JobConfig(
+        reference=main_wav,
+        role=ReferenceRole.NOISY,
+        main=main_wav,
+        output=out_wav,
+        start_sec=2.0,
+        end_sec=4.0,
+        audit=True,
+    )
+    audit_file = generate_audit_manifest(cfg=cfg, output_path=out_wav)
+    data = json.loads(audit_file.read_text(encoding="utf-8"))
+    # Input true peak inside [2.0, 4.0] must reflect quiet s2, NOT 0.9 sine wave in [0.0, 2.0]
+    assert data["true_peak_dbfs"]["input"] < -5.0
+    assert data["speech_summary"]["total_duration_sec"] == pytest.approx(2.0, abs=0.05)
+
+
+def test_cli_chunk_and_overlap_flags(tmp_path):
+    """Verify CLI parser and validation accept and validate --chunk-duration and --overlap-duration."""
+    from zout.app import _build_parser, _validate
+
+    parser = _build_parser()
+    ref = tmp_path / "r.wav"
+    main = tmp_path / "m.wav"
+    ref.write_bytes(b"0")
+    main.write_bytes(b"0")
+
+    args = parser.parse_args([
+        "-r", str(ref), "-m", str(main), "-t", "noisy",
+        "--chunk-duration", "25.0", "--overlap-duration", "1.5",
+    ])
+    _validate(parser, args)
+    assert args.chunk_duration == 25.0
+    assert args.overlap_duration == 1.5
+
+    bad = parser.parse_args([
+        "-r", str(ref), "-m", str(main), "-t", "noisy",
+        "--chunk-duration", "5.0", "--overlap-duration", "5.0",
+    ])
+    with pytest.raises(SystemExit):
+        _validate(parser, bad)
+
+
+def test_audio_player_status_text_uses_sample_index():
+    """Verify AudioPlayer.status_text uses _sample_index/_sr when audio buffer is active."""
+    from zout.audio.player import AudioPlayer
+
+    p = AudioPlayer()
+    p._audio_a = np.zeros((48000 * 10, 2), dtype=np.float32)
+    p._sr = 48000
+    p._duration = 10.0
+    p._sample_index = 48000 * 3
+    p._start_time = 0.0  # stale wall-clock would clamp to 10.0s
+    p._is_playing = True
+    p._target_name = "Main Recording"
+    assert "(3.0s / 10.0s)" in p.status_text()
+
+
+def test_collect_deps_status_includes_pysilero_vad():
+    """Verify collect_deps_status checks pysilero_vad cleanly."""
+    from zout.config import collect_deps_status
+
+    rows = collect_deps_status()
+    labels = " ".join(label for _, label, _, _ in rows).lower()
+    assert "pysilero-vad" in labels
+    assert "noisereduce" in labels
+    assert "voxlock" in labels
+
+
+def test_kl_nmf_empty_matrix_guard():
+    """Verify kl_nmf handles empty / zero-frame spectrogram matrices safely."""
+    from zout.engines.noisy_engine import kl_nmf
+
+    V = np.zeros((513, 0), dtype=np.float32)
+    W = np.ones((513, 24), dtype=np.float32)
+    H = np.zeros((24, 0), dtype=np.float32)
+    W_out, H_out = kl_nmf(V, W, H, n_iter=10)
+    assert W_out.shape == W.shape
+    assert H_out.shape == H.shape
+    assert np.isfinite(W_out).all()
+    assert np.isfinite(H_out).all()

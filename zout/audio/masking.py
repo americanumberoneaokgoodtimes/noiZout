@@ -45,7 +45,8 @@ def noise_suppression_db(x_in: np.ndarray, y_out: np.ndarray) -> float:
         h = 1024
         m = len(a) // h
         if m == 0:
-            return -100.0
+            # Audio shorter than one frame — compute energy over the full array
+            return float(10 * np.log10(np.mean(a ** 2) + 1e-12))
         e = 10 * np.log10(np.mean(a[: m * h].reshape(m, h) ** 2, axis=1) + 1e-12)
         return float(np.percentile(e, 10))
     return floor(x_in) - floor(y_out)

@@ -62,15 +62,23 @@ class CleanVoiceEngine:
         p("Loading VoxLock", 0.1)
         vl = self._model()
 
+        # Instantiate DeepFilter once — avoids re-loading ONNX model per call
+        _polish_model: object = None
+        if polish:
+            try:
+                from .deepfilter import DeepFilter
+                _polish_model = DeepFilter(100.0)
+            except Exception as e:
+                info["polish_error"] = str(e)
+
         def _process_chunk(chunk: np.ndarray) -> np.ndarray:
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("Cancelled")
             work = chunk
-            if polish:
+            if _polish_model is not None:
                 p("DeepFilterNet3 pre-denoise", 0.15)
                 try:
-                    from .deepfilter import DeepFilter
-                    work = DeepFilter(100.0).process(chunk, sr)
+                    work = _polish_model.process(chunk, sr)
                 except Exception as e:  # polish is optional
                     info["polish_error"] = str(e)
 
@@ -78,7 +86,7 @@ class CleanVoiceEngine:
                 raise InterruptedError("Cancelled")
 
             p("Extracting matching voice", 0.4)
-            chunk16 = resample(work, sr, SR_TSE)
+            chunk16 = work if sr == SR_TSE else resample(work, sr, SR_TSE)
             tse16 = np.asarray(vl.isolate(chunk16, sample=enroll), dtype=np.float32)
             del chunk16
 
@@ -132,24 +140,37 @@ class CleanVoiceEngine:
         p("Loading VoxLock", 0.1)
         vl = self._model()
 
+        # Instantiate DeepFilter once — avoids re-loading ONNX model per chunk
+        _polish_model: object = None
+        if polish:
+            try:
+                from .deepfilter import DeepFilter
+                _polish_model = DeepFilter(100.0)
+            except Exception as e:
+                info["polish_error"] = str(e)
+
+        p("Speaker model ready — processing chunks", 0.12)
+
         def process_chunk(chunk: np.ndarray) -> np.ndarray:
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("Cancelled")
             work = chunk
-            if polish:
+            if _polish_model is not None:
                 try:
-                    from .deepfilter import DeepFilter
-                    work = DeepFilter(100.0).process(chunk, sr)
+                    work = _polish_model.process(chunk, sr)
                 except Exception as e:
                     info["polish_error"] = str(e)
 
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("Cancelled")
 
-            chunk16 = resample(work, sr, SR_TSE)
+            chunk16 = work if sr == SR_TSE else resample(work, sr, SR_TSE)
             tse16 = np.asarray(vl.isolate(chunk16, sample=enroll), dtype=np.float32)
             est = self._restore_fullband(work, tse16, sr)
             return apply_adaptive_mask(chunk, est, sr, strength, max_atten_db)
+
+        def _chunk_progress(msg: str, f: float) -> None:
+            p(msg, 0.12 + f * 0.88)
 
         stats = _stream_disk_to_disk(
             main_path=main_path,
@@ -160,7 +181,7 @@ class CleanVoiceEngine:
             overlap_sec=overlap_sec,
             start_sec=start_sec,
             end_sec=end_sec,
-            progress=p,
+            progress=_chunk_progress,
             cancel_event=cancel_event,
         )
         info.update(stats)

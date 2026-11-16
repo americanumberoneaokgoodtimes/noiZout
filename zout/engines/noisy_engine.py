@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from ..audio.io import peak_limit
+from ..audio.io import NATIVE_EXTENSIONS, get_audio_info, load_audio, local_peak_limit
 from ..audio.masking import _istft, _stft, apply_adaptive_mask
 
 Progress = Callable[[str, float], None]
@@ -25,8 +25,12 @@ def kl_nmf(
     cancel_event: threading.Event | None = None,
 ):
     """Multiplicative-update KL-NMF. `update_w` is a bool mask over columns of W allowed to change."""
+    if V.size == 0 or V.shape[1] == 0:
+        return W, H
     eps = 1e-9
-    V = V.astype(np.float32) + eps
+    V = V.astype(np.float32, copy=False) + eps
+    # Pre-compute free-column indices once to avoid repeated np.where inside the loop
+    free_cols = np.where(update_w)[0] if update_w is not None else None
     for i in range(n_iter):
         if cancel_event is not None and i % 10 == 0 and cancel_event.is_set():
             raise InterruptedError("Cancelled")
@@ -34,12 +38,11 @@ def kl_nmf(
         H *= (W.T @ (V / WH)) / (W.sum(0)[:, None] + eps)
         WH = W @ H + eps
         num = (V / WH) @ H.T
-        den = H.sum(1)[None, :] + eps
-        upd = W * (num / den)
-        if update_w is None:
-            W = upd
+        den = H.sum(1) + eps  # (K,) — avoids 2D allocation
+        if free_cols is None:
+            W *= num / den[None, :]  # in-place: no temporary upd array
         else:
-            W = np.where(update_w[None, :], upd, W)
+            W[:, free_cols] *= num[:, free_cols] / den[free_cols]  # update only free columns
     return W, H
 
 
@@ -72,9 +75,10 @@ def _stream_disk_to_disk(
     if cancel_event is not None and cancel_event.is_set():
         raise InterruptedError("Cancelled")
 
-    info = sf.info(str(main_path))
+    info = get_audio_info(main_path)
     file_sr = info.samplerate
-    total_frames = info.frames
+    total_frames = info.frames or int(round(info.duration * file_sr))
+    is_native = Path(main_path).suffix.lower() in NATIVE_EXTENSIONS
 
     if start_sec is not None and start_sec >= info.duration:
         raise ValueError(f"start_sec exceeds audio duration ({start_sec} >= {info.duration})")
@@ -106,8 +110,18 @@ def _stream_disk_to_disk(
         N_overlap = N_chunk // 4
 
     def read_input(start_f: int, num_f: int) -> np.ndarray:
-        data, _ = sf.read(str(main_path), start=start_f, frames=num_f, dtype="float32", always_2d=True)
-        return data.mean(axis=1) if data.ndim > 1 else data.reshape(-1)
+        if is_native:
+            data, _ = sf.read(str(main_path), start=start_f, frames=num_f, dtype="float32", always_2d=True)
+            out = data.mean(axis=1) if data.ndim > 1 else data.reshape(-1)
+        else:
+            c_start = start_f / float(file_sr)
+            c_end = (start_f + num_f) / float(file_sr)
+            out, _ = load_audio(main_path, mono=True, start_sec=c_start, end_sec=c_end)
+        if len(out) > num_f:
+            return out[:num_f]
+        if len(out) < num_f:
+            return np.pad(out, (0, num_f - len(out)))
+        return out
 
     in_frame_energies: list[float] = []
     out_frame_energies: list[float] = []
@@ -133,7 +147,7 @@ def _stream_disk_to_disk(
 
                 if cancel_event is not None and cancel_event.is_set():
                     raise InterruptedError("Cancelled")
-                y = peak_limit(process_chunk(chunk_in))
+                y = local_peak_limit(process_chunk(chunk_in))
                 if len(y) != len(chunk_in):
                     y = y[: len(chunk_in)] if len(y) > len(chunk_in) else np.pad(y, (0, len(chunk_in) - len(y)))
 
@@ -147,6 +161,8 @@ def _stream_disk_to_disk(
                 offset += read_len
                 chunk_idx += 1
                 p(f"Processing chunk {chunk_idx}/{total_chunks}", min(0.95, chunk_idx / total_chunks))
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError("Cancelled")
         else:
             theta = np.pi * (np.arange(N_overlap, dtype=np.float32) + 0.5) / float(N_overlap)
             w_in = (0.5 * (1.0 - np.cos(theta))).astype(np.float32)
@@ -175,7 +191,7 @@ def _stream_disk_to_disk(
 
                 if cancel_event is not None and cancel_event.is_set():
                     raise InterruptedError("Cancelled")
-                y = peak_limit(process_chunk(chunk_in))
+                y = local_peak_limit(process_chunk(chunk_in))
                 if len(y) != len(chunk_in):
                     y = y[: len(chunk_in)] if len(y) > len(chunk_in) else np.pad(y, (0, len(chunk_in) - len(y)))
 
@@ -191,7 +207,7 @@ def _stream_disk_to_disk(
                     tail = y[hop:]
                     offset += hop
                 elif is_last:
-                    blend = peak_limit(tail * w_out + y[:N_overlap] * w_in)
+                    blend = local_peak_limit(tail * w_out + y[:N_overlap] * w_in)
                     out_sf.write(blend)
                     out_sum_sq += float(np.sum(blend.astype(np.float64) ** 2))
                     total_out_samples += len(blend)
@@ -205,7 +221,7 @@ def _stream_disk_to_disk(
                     tail = None
                     offset += read_len
                 else:
-                    blend = peak_limit(tail * w_out + y[:N_overlap] * w_in)
+                    blend = local_peak_limit(tail * w_out + y[:N_overlap] * w_in)
                     out_sf.write(blend)
                     out_sum_sq += float(np.sum(blend.astype(np.float64) ** 2))
                     total_out_samples += len(blend)
@@ -222,6 +238,8 @@ def _stream_disk_to_disk(
 
                 chunk_idx += 1
                 p(f"Processing chunk {chunk_idx}/{total_chunks}", min(0.95, chunk_idx / total_chunks))
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError("Cancelled")
 
     finally:
         if out_sf is not None and not out_sf.closed:
@@ -260,7 +278,7 @@ class NoisyAcousticEngine:
     def run(self, ref: np.ndarray, main: np.ndarray, sr: int, strength: float,
             max_atten_db: float, progress: Progress | None = None,
             polish: bool = False,
-            cancel_event: threading.Event | None = None) -> np.ndarray:
+            cancel_event: threading.Event | None = None) -> tuple[np.ndarray, dict]:
         try:
             import noisereduce as nr
         except ImportError:
@@ -269,6 +287,7 @@ class NoisyAcousticEngine:
             ) from None
         rng = np.random.default_rng(0)
         p = progress or (lambda *_: None)
+        info: dict = {}
 
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("Cancelled")
@@ -279,7 +298,7 @@ class NoisyAcousticEngine:
             R = R[:, :: R.shape[1] // 800 + 1]
         Wn = rng.random((R.shape[0], self.K_NOISE), dtype=np.float32) + 0.1
         Hn = rng.random((self.K_NOISE, R.shape[1]), dtype=np.float32) + 0.1
-        Wn, _ = kl_nmf(R, Wn, Hn, 80, cancel_event=cancel_event)
+        Wn, _ = kl_nmf(R, Wn, Hn, 40, cancel_event=cancel_event)
         Wn /= Wn.sum(0, keepdims=True) + 1e-9
 
         if cancel_event is not None and cancel_event.is_set():
@@ -291,9 +310,24 @@ class NoisyAcousticEngine:
         pw = 1.0 + strength
         free = np.concatenate([np.zeros(self.K_NOISE, bool), np.ones(self.K_SIG, bool)])
 
+        # Pre-allocate W template: Wn columns frozen, Ws columns reset each chunk
+        F_bins = Wn.shape[0]
+        _W_template = np.empty((F_bins, self.K_NOISE + self.K_SIG), dtype=np.float32)
+        _W_template[:, :self.K_NOISE] = Wn
+
+        # Instantiate DeepFilter once — avoids re-loading ONNX model per call
+        _polish_model: object = None
+        if polish:
+            try:
+                from .deepfilter import DeepFilter
+                _polish_model = DeepFilter(100.0 if max_atten_db >= 60 else max_atten_db)
+            except Exception as e:
+                info["polish_error"] = str(e)
+
         def _process_single(chunk: np.ndarray) -> np.ndarray:
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("Cancelled")
+            p("Spectral gate + noisereduce", 0.20)
             gated = nr.reduce_noise(y=chunk, sr=sr, y_noise=ref, stationary=True,
                                     prop_decrease=prop, n_std_thresh_stationary=thresh,
                                     freq_mask_smooth_hz=350, n_fft=1024,
@@ -302,38 +336,39 @@ class NoisyAcousticEngine:
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("Cancelled")
 
+            p("STFT decomposition", 0.40)
             Z = _stft(gated, sr)
             del gated
             V = np.abs(Z).astype(np.float32)
             F, T = V.shape
-            Ws = rng.random((F, self.K_SIG), dtype=np.float32) + 0.1
-            W = np.concatenate([Wn, Ws], axis=1)
+            W = _W_template.copy()
+            W[:, self.K_NOISE:] = rng.random((F, self.K_SIG), dtype=np.float32) + 0.1
             H = rng.random((W.shape[1], T), dtype=np.float32) + 0.1
-            W, H = kl_nmf(V, W, H, 50, update_w=free, cancel_event=cancel_event)
+            p("KL-NMF source separation", 0.50)
+            W, H = kl_nmf(V, W, H, 25, update_w=free, cancel_event=cancel_event)
             Vn = W[:, : self.K_NOISE] @ H[: self.K_NOISE]
             Vs = W[:, self.K_NOISE:] @ H[self.K_NOISE:]
             mask = Vs ** pw / (Vs ** pw + (beta * Vn) ** pw + 1e-9)
             Z *= mask
             del mask, Vn, Vs
+            p("Reconstructing signal", 0.78)
             est = _istft(Z, sr, len(chunk))
-            del Z, V, W, H, Ws
+            del Z, V, W, H
 
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("Cancelled")
 
-            if polish:
-                p("DeepFilterNet3 polish", 0.8)
+            if _polish_model is not None:
+                p("DeepFilterNet3 polish", 0.84)
                 try:
-                    from .deepfilter import DeepFilter
-                    est = DeepFilter(100.0 if max_atten_db >= 60 else max_atten_db).process(est, sr)
-                except Exception:
-                    pass
-            p("Shaping mask", 0.9)
+                    est = _polish_model.process(est, sr)
+                except Exception as e:
+                    info["polish_error"] = str(e)
+            p("Shaping adaptive mask", 0.92)
             return apply_adaptive_mask(chunk, est, sr, strength, max_atten_db)
 
-        p("Spectral gate with reference profile", 0.25)
-        p("Separating noise bases from recording", 0.5)
-        return _process_single(main)
+        p("Noise profile ready", 0.10)
+        return _process_single(main), info
 
     def run_streaming(
         self,
@@ -369,7 +404,7 @@ class NoisyAcousticEngine:
             R = R[:, :: R.shape[1] // 800 + 1]
         Wn = rng.random((R.shape[0], self.K_NOISE), dtype=np.float32) + 0.1
         Hn = rng.random((self.K_NOISE, R.shape[1]), dtype=np.float32) + 0.1
-        Wn, _ = kl_nmf(R, Wn, Hn, 80, cancel_event=cancel_event)
+        Wn, _ = kl_nmf(R, Wn, Hn, 40, cancel_event=cancel_event)
         Wn /= Wn.sum(0, keepdims=True) + 1e-9
 
         thresh = float(2.6 - 1.9 * strength)
@@ -377,6 +412,23 @@ class NoisyAcousticEngine:
         beta = 0.2 + 1.8 * strength
         pw = 1.0 + strength
         free = np.concatenate([np.zeros(self.K_NOISE, bool), np.ones(self.K_SIG, bool)])
+
+        # Pre-allocate W template: Wn columns frozen, Ws columns reset each chunk
+        F_bins = Wn.shape[0]
+        _W_template = np.empty((F_bins, self.K_NOISE + self.K_SIG), dtype=np.float32)
+        _W_template[:, :self.K_NOISE] = Wn
+
+        # Instantiate DeepFilter once — avoids re-loading ONNX model per chunk
+        _polish_notes: dict = {}
+        _polish_model: object = None
+        if polish:
+            try:
+                from .deepfilter import DeepFilter
+                _polish_model = DeepFilter(100.0 if max_atten_db >= 60 else max_atten_db)
+            except Exception as e:
+                _polish_notes["polish_error"] = str(e)
+
+        p("Noise profile ready — processing chunks", 0.10)
 
         def process_chunk(chunk: np.ndarray) -> np.ndarray:
             if cancel_event is not None and cancel_event.is_set():
@@ -391,24 +443,26 @@ class NoisyAcousticEngine:
             del gated
             V = np.abs(Z).astype(np.float32)
             F, T = V.shape
-            Ws = rng.random((F, self.K_SIG), dtype=np.float32) + 0.1
-            W = np.concatenate([Wn, Ws], axis=1)
+            W = _W_template.copy()
+            W[:, self.K_NOISE:] = rng.random((F, self.K_SIG), dtype=np.float32) + 0.1
             H = rng.random((W.shape[1], T), dtype=np.float32) + 0.1
-            W, H = kl_nmf(V, W, H, 50, update_w=free, cancel_event=cancel_event)
+            W, H = kl_nmf(V, W, H, 25, update_w=free, cancel_event=cancel_event)
             Vn = W[:, : self.K_NOISE] @ H[: self.K_NOISE]
             Vs = W[:, self.K_NOISE :] @ H[self.K_NOISE :]
             mask = Vs ** pw / (Vs ** pw + (beta * Vn) ** pw + 1e-9)
             Z *= mask
             del mask, Vn, Vs
             est = _istft(Z, sr, len(chunk))
-            del Z, V, W, H, Ws
-            if polish:
+            del Z, V, W, H
+            if _polish_model is not None:
                 try:
-                    from .deepfilter import DeepFilter
-                    est = DeepFilter(100.0 if max_atten_db >= 60 else max_atten_db).process(est, sr)
-                except Exception:
-                    pass
+                    est = _polish_model.process(est, sr)
+                except Exception as e:
+                    _polish_notes["polish_error"] = str(e)
             return apply_adaptive_mask(chunk, est, sr, strength, max_atten_db)
+
+        def _chunk_progress(msg: str, f: float) -> None:
+            p(msg, 0.10 + f * 0.90)
 
         stats = _stream_disk_to_disk(
             main_path=main_path,
@@ -419,7 +473,8 @@ class NoisyAcousticEngine:
             overlap_sec=overlap_sec,
             start_sec=start_sec,
             end_sec=end_sec,
-            progress=p,
+            progress=_chunk_progress,
             cancel_event=cancel_event,
         )
+        stats.update(_polish_notes)
         return Path(out_path), stats

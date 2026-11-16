@@ -8,9 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import soundfile as sf
-
-from .audio.io import load_audio, peak_limit, resample, rms_db, save_audio
+from .audio.io import get_audio_info, load_audio, peak_limit, resample, rms_db, save_audio
 from .audio.masking import noise_suppression_db
 from .config import JobConfig, ReferenceRole, SUPPORTED_AUDIO_EXTENSIONS
 from .engines.clean_engine import CleanVoiceEngine
@@ -67,7 +65,7 @@ def run_streaming(
     p = progress or (lambda *_: None)
     t0 = time.time()
 
-    info = sf.info(str(cfg.main))
+    info = get_audio_info(cfg.main)
     sr = info.samplerate
     file_dur = info.duration
 
@@ -304,7 +302,7 @@ def run_job(
     if cfg.batch_dir is not None:
         return run_batch(cfg, progress=progress, cancel_token=cancel_token)
 
-    info = sf.info(str(cfg.main))
+    info = get_audio_info(cfg.main)
     file_dur = info.duration
     sr = info.samplerate
     st = cfg.start_sec or 0.0
@@ -353,9 +351,8 @@ def run_job(
                 raise InterruptedError("Cancelled")
             p(msg, 0.05 + 0.9 * f)
 
-        notes: dict = {}
         if cfg.role is ReferenceRole.NOISY:
-            out = NoisyAcousticEngine().run(
+            out, notes = NoisyAcousticEngine().run(
                 resample(ref, ref_sr, sr),
                 main,
                 sr,

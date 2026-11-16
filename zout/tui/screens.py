@@ -17,7 +17,7 @@ from rich.text import Text
 from ..audio.io import compute_waveform_envelope, parse_time_spec, probe_audio, save_audio
 from ..audio.noise_extractor import extract_noise_profile
 from ..audio.player import player
-from ..config import JobConfig, ReferenceRole
+from ..config import JobConfig, ReferenceRole, collect_deps_status
 from ..pipeline import Result, run_job
 from . import themes
 from .keys import poll_key, read_key
@@ -209,8 +209,14 @@ def dashboard(cfg: JobConfig, msg: str = "", theme: themes.Theme | None = None) 
                                                              f"  {atten_label(cfg.max_atten_db)}"))
     t.add_row(key("F", th), "DeepFilterNet3 polish", Text("ON" if cfg.use_polish() else "OFF",
                                                           style=f"bold {th.success}" if cfg.use_polish() else "bold red"))
-    out = cfg.output or (cfg.default_output() if cfg.main else None)
-    t.add_row(key("O", th), "Output file", Text(str(out) if out else "<auto>", style="dim"))
+    t.add_row(Text("  ", style="dim"), "Streaming window",
+              Text(f"{cfg.chunk_duration:.0f}s chunk / {cfg.overlap_duration:.1f}s overlap  [Press 3/4 to edit]", style="dim"))
+    if cfg.batch_dir is not None:
+        out_dir = cfg.out_dir or (cfg.batch_dir / "processed")
+        t.add_row(key("O", th), "Output directory", Text(str(out_dir), style="dim"))
+    else:
+        out = cfg.output or (cfg.default_output() if cfg.main else None)
+        t.add_row(key("O", th), "Output file", Text(str(out) if out else "<auto>", style="dim"))
 
     # Batch directory display (R8)
     if cfg.batch_dir:
@@ -235,7 +241,8 @@ def dashboard(cfg: JobConfig, msg: str = "", theme: themes.Theme | None = None) 
         key("F", th), " Polish  ",
         key("C", th), " Theme  ",
         key("B", th), " Batch  ",
-        key("O", th), " Out",
+        key("O", th), " Out  ",
+        key("D", th), " Deps",
     )
     ctl2 = Text.assemble(
         key("P", th), " Play Ref  ",
@@ -312,33 +319,193 @@ def _make_param_row(i: int, current_field: int, title: str, widget: Text, hints:
 
 def prompt_params(console: Console, cfg: JobConfig, theme: themes.Theme | None = None) -> None:
     th = theme or themes.get_theme()
+    orig = (cfg.strength, cfg.max_atten_db, cfg.chunk_duration, cfg.overlap_duration)
     field = 0
     while True:
+        max_ov = min(15.0, max(0.0, round(cfg.chunk_duration * 0.49, 1)))
         body = Group(
-            _make_param_row(0, field, "1. Strength (adaptive threshold / power)", Text.assemble(bar(cfg.strength, 0, 1, theme=th), f"  {cfg.strength:.2f} {strength_label(cfg.strength)}"),
-                "Low 0.1-0.4 gentle | 0.5-0.8 recommended | 0.85-1.0 maximum separation"),
-            _make_param_row(1, field, "2. Max attenuation cap (ambience guard)", Text.assemble(bar(min(cfg.max_atten_db, 60), 6, 60, color=th.secondary, theme=th), f"  {atten_label(cfg.max_atten_db)}"),
-                "Caps maximum cut so quiet syllables never drop to dead silence. [L]12 [B]24 [H]40 [U]uncapped"),
-            Text.assemble(key("Tab", th), " switch  ", key("←/→", th), " adjust  ", key("Enter", th), " done"))
+            _make_param_row(
+                0, field, "1. Strength (adaptive threshold / power)",
+                Text.assemble(bar(cfg.strength, 0, 1, theme=th), f"  {cfg.strength:.2f} {strength_label(cfg.strength)}"),
+                "Low 0.1-0.4 gentle | 0.5-0.8 recommended | 0.85-1.0 maximum separation",
+            ),
+            _make_param_row(
+                1, field, "2. Max attenuation cap (ambience guard)",
+                Text.assemble(bar(min(cfg.max_atten_db, 60), 6, 60, color=th.secondary, theme=th), f"  {atten_label(cfg.max_atten_db)}"),
+                "Caps maximum cut so quiet syllables never drop to dead silence. [L]12 [B]24 [H]40 [U]uncapped",
+            ),
+            _make_param_row(
+                2, field, "3. Streaming chunk duration",
+                Text.assemble(bar(cfg.chunk_duration, 5.0, 120.0, color=th.primary, theme=th), f"  {cfg.chunk_duration:.0f} s"),
+                "Block window for disk-to-disk streaming (5s - 120s). [D]60s default",
+            ),
+            _make_param_row(
+                3, field, "4. Streaming overlap duration",
+                Text.assemble(bar(cfg.overlap_duration, 0.0, max(1.0, max_ov), color=th.success, theme=th), f"  {cfg.overlap_duration:.1f} s"),
+                f"Raised-cosine crossfade overlap (0.0s - {max_ov:.1f}s). [D]2.0s default",
+            ),
+            Text.assemble(key("Tab/↑/↓", th), " switch  ", key("←/→", th), " adjust  ", key("Enter", th), " confirm  ", key("Esc", th), " cancel"),
+        )
         console.clear()
-        console.print(Panel(body, title=f"[bold {th.accent}]Step 5 :: Inference Threshold & Guard[/]", border_style=th.border))
+        console.print(Panel(body, title=f"[bold {th.accent}]Step 5 :: Inference Threshold & Streaming[/]", border_style=th.border))
         k = read_key()
         if k is None:
             continue
-        if k.name in ("tab", "up", "down"):
-            field = 1 - field
+        if k.name in ("tab", "down"):
+            field = (field + 1) % 4
+        elif k.name == "up":
+            field = (field - 1) % 4
         elif k.name in ("left", "right"):
             d = 1 if k.name == "right" else -1
             if field == 0:
                 cfg.strength = round(min(1.0, max(0.0, cfg.strength + 0.05 * d)), 2)
-            else:
+            elif field == 1:
                 cur = 60.0 if cfg.max_atten_db >= 60 else cfg.max_atten_db
                 cfg.max_atten_db = float(min(60, max(6, cur + 3 * d)))
-        elif k.name == "char" and field == 1:
-            preset = {"l": 12.0, "b": 24.0, "h": 40.0, "u": 60.0}.get(k.char.lower())
-            if preset:
-                cfg.max_atten_db = preset
+            elif field == 2:
+                cfg.chunk_duration = float(min(120.0, max(5.0, cfg.chunk_duration + 5.0 * d)))
+                cap_ov = min(15.0, max(0.0, round(cfg.chunk_duration * 0.49, 1)))
+                if cfg.overlap_duration > cap_ov:
+                    cfg.overlap_duration = cap_ov
+            elif field == 3:
+                cfg.overlap_duration = round(min(max_ov, max(0.0, cfg.overlap_duration + 0.5 * d)), 1)
+        elif k.name == "char":
+            c = k.char.lower()
+            if field == 1:
+                preset = {"l": 12.0, "b": 24.0, "h": 40.0, "u": 60.0}.get(c)
+                if preset:
+                    cfg.max_atten_db = preset
+            elif field == 2 and c == "d":
+                cfg.chunk_duration = 60.0
+            elif field == 3 and c == "d":
+                cfg.overlap_duration = min(2.0, max_ov)
         elif k.name == "enter":
+            return
+        elif k.name == "esc":
+            cfg.strength, cfg.max_atten_db, cfg.chunk_duration, cfg.overlap_duration = orig
+            return
+
+
+def prompt_output_path(console: Console, cfg: JobConfig, theme: themes.Theme | None = None) -> None:
+    """Interactive modal to configure single-file output path or batch output directory."""
+    from .file_picker import pick_directory
+
+    th = theme or themes.get_theme()
+    is_batch = cfg.batch_dir is not None
+    auto_default = str(cfg.batch_dir / "processed") if is_batch else str(cfg.default_output() or "<main>_zout.wav")
+    cur_str = str(cfg.out_dir) if is_batch and cfg.out_dir else (str(cfg.output) if not is_batch and cfg.output else "")
+    focus = 0  # 0: path input, 1: browse folder, 2: reset auto default
+
+    while True:
+        disp_val = cur_str if cur_str else f"<Auto: {auto_default}>"
+        row0 = Text.assemble(
+            ("> " if focus == 0 else "  ", "bold yellow"),
+            ("Output Directory: " if is_batch else "Output File Path: ", "bold"),
+            (disp_val, f"bold {th.primary}" if cur_str else "dim"),
+        )
+        row1 = Text.assemble(
+            ("> " if focus == 1 else "  ", "bold yellow"),
+            ("[ Browse Folder... ]", f"bold {th.accent}" if focus == 1 else "bright_white"),
+            "  Pick destination folder",
+        )
+        row2 = Text.assemble(
+            ("> " if focus == 2 else "  ", "bold yellow"),
+            ("[ Reset to Auto Default ]", f"bold {th.success}" if focus == 2 else "bright_white"),
+            f"  ({auto_default})",
+        )
+        body = Group(
+            Text("Type path directly while line 1 is focused, or Tab to Browse / Reset.\n", style="dim"),
+            row0,
+            Text("      Supported write extensions: .wav, .flac, .ogg (others save as .wav)\n" if not is_batch else "\n", style="dim"),
+            row1,
+            row2,
+            Text(""),
+            Text.assemble(
+                key("Tab/↑/↓", th), " Switch action  ",
+                key("Enter", th), " Confirm / Activate  ",
+                key("Esc", th), " Cancel",
+            ),
+        )
+        title = f"[bold {th.accent}]{'Batch Output Directory' if is_batch else 'Output File Destination'}[/]"
+        console.clear()
+        console.print(Panel(body, title=title, border_style=th.border, box=box.ROUNDED))
+
+        k = read_key()
+        if k is None:
+            continue
+        if k.name in ("tab", "down"):
+            focus = (focus + 1) % 3
+        elif k.name == "up":
+            focus = (focus - 1) % 3
+        elif k.name == "esc":
+            return
+        elif focus == 0 and k.name == "backspace":
+            cur_str = cur_str[:-1]
+        elif focus == 0 and k.name == "space":
+            cur_str += " "
+        elif focus == 0 and k.name == "char" and k.char >= " ":
+            cur_str += k.char
+        elif k.name == "enter":
+            if focus == 0:
+                cleaned = cur_str.strip().strip('"').strip("'")
+                if is_batch:
+                    cfg.out_dir = Path(cleaned) if cleaned else None
+                else:
+                    cfg.output = Path(cleaned) if cleaned else None
+                return
+            elif focus == 1:
+                seed_dir = (
+                    Path(cur_str).parent if (cur_str and not is_batch)
+                    else Path(cur_str) if (cur_str and is_batch)
+                    else (cfg.batch_dir or (cfg.main.parent if cfg.main else None))
+                )
+                picked = pick_directory(console, "Select output directory", seed_dir, theme=th)
+                if picked is not None:
+                    if is_batch:
+                        cur_str = str(picked)
+                    else:
+                        default_name = cfg.output.name if cfg.output else (
+                            cfg.default_output().name if cfg.default_output() else "output_zout.wav"
+                        )
+                        cur_str = str(picked / default_name)
+                focus = 0
+            elif focus == 2:
+                cur_str = ""
+                if is_batch:
+                    cfg.out_dir = None
+                else:
+                    cfg.output = None
+                focus = 0
+
+
+def prompt_deps_check(console: Console, theme: themes.Theme | None = None) -> None:
+    """Display interactive dependency & runtime diagnostics modal inside the TUI."""
+    th = theme or themes.get_theme()
+    rows = collect_deps_status()
+
+    tbl = Table(box=box.SIMPLE_HEAD, expand=True, header_style=f"bold {th.primary}")
+    tbl.add_column("Category", style="dim", width=20)
+    tbl.add_column("Component", style="bright_white")
+    tbl.add_column("Status", width=10, justify="center")
+    tbl.add_column("Notes", style="dim")
+
+    for section, label, status, detail in rows:
+        style = f"bold {th.success}" if status == "OK" else ("bold yellow" if status == "SLIM" else "bold red")
+        tbl.add_row(section, label, Text(status, style=style), detail)
+
+    body = Group(
+        tbl,
+        Text(""),
+        Text.assemble(key("Enter", th), " / ", key("Esc", th), " Back to dashboard"),
+    )
+    console.clear()
+    console.print(Panel(body, title=f"[bold {th.accent}]Runtime Dependency & Engine Diagnostics[/]",
+                        border_style=th.border, box=box.ROUNDED))
+    while True:
+        k = read_key()
+        if k is None:
+            continue
+        if k.name in ("enter", "esc") or (k.name == "char" and k.char.lower() == "q"):
             return
 
 
@@ -533,8 +700,11 @@ def run_with_progress(console: Console, cfg: JobConfig, theme: themes.Theme | No
         finally:
             res_box["done"] = True
 
+    live_active = True
     with Live(view(), console=console, refresh_per_second=10) as live:
         def cb(msg: str, f: float):
+            if not live_active:
+                return
             state["msg"], state["f"] = msg, f
             live.update(view())
 
@@ -549,18 +719,24 @@ def run_with_progress(console: Console, cfg: JobConfig, theme: themes.Theme | No
                 live.update(view())
                 break
 
-        if cancel_ev.is_set():
-            worker_thread.join(timeout=3.0)
-            return None
+    live_active = False
 
-        worker_thread.join(timeout=1.0)
-        if res_box["error"] is not None:
-            return res_box["error"]
-        return res_box["result"]
+    if cancel_ev.is_set():
+        worker_thread.join(timeout=3.0)
+        return None
+
+    worker_thread.join(timeout=1.0)
+    if res_box["error"] is not None:
+        return res_box["error"]
+    return res_box["result"]
 
 
-def result_card(res: Result | Exception, play_status: str = "", theme: themes.Theme | None = None) -> Panel:
+def result_card(res: Result | Exception | None, play_status: str = "", theme: themes.Theme | None = None) -> Panel:
     th = theme or themes.get_theme()
+    if res is None:
+        return Panel(Group(Text("Processing was cancelled.", style="bold yellow"),
+                           Text.assemble(key("Enter", th), " back")),
+                     title="[bold yellow]Cancelled[/]", border_style="yellow", box=box.ROUNDED)
     if isinstance(res, Exception):
         return Panel(Group(Text(f"{type(res).__name__}: {res}", style="bold red"),
                            Text.assemble(key("Enter", th), " back")),
@@ -572,6 +748,8 @@ def result_card(res: Result | Exception, play_status: str = "", theme: themes.Th
         lines.append(Text(res.notes["warning"], style="yellow"))
     if res.notes.get("polish_error"):
         lines.append(Text("Polish skipped: " + res.notes["polish_error"], style="yellow"))
+    if res.audit_path is not None:
+        lines.append(Text.assemble(("Audit: ", "bold"), (str(res.audit_path), "dim")))
     if res.notes.get("batch"):
         success = res.notes.get("success", 0)
         total = res.notes.get("total", 0)
@@ -590,12 +768,20 @@ def result_card(res: Result | Exception, play_status: str = "", theme: themes.Th
             lines.append(render_stereo_vu_meter(player, width=22, theme=th))
 
     lines.append(Text(""))
-    lines.append(Text.assemble(
-        key("Tab", th), " Hot-Swap A/B  ",
-        key("Space", th), " Toggle Play  ",
-        key("C", th), " Theme  ",
-        key("Enter", th), " Back to menu"
-    ))
+    if res.notes.get("batch"):
+        lines.append(Text.assemble(
+            key("C", th), " Theme  ",
+            key("Enter", th), " Back to menu",
+        ))
+    else:
+        lines.append(Text.assemble(
+            key("P", th), " Processed  ",
+            key("p", th), " Original  ",
+            key("Tab", th), " A/B Swap  ",
+            key("Space", th), " Play/Stop  ",
+            key("C", th), " Theme  ",
+            key("Enter", th), " Back",
+        ))
     return Panel(Group(*lines), title=f"[bold {th.accent}]Processing Complete[/]", border_style=th.border, box=box.ROUNDED)
 
 
@@ -669,12 +855,27 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
         elif k.name == "enter":
             break
 
-    # Run extraction with live progress
+    # Run extraction with live progress and cancellation support
+    import time as _time
+    cancel_ev = threading.Event()
     bar_ = ProgressBar(total=100, width=50, complete_style=th.primary, finished_style=th.success)
-    state = {"msg": "Loading audio file...", "f": 0.05}
+    state = {"msg": "Loading audio file...", "f": 0.05, "cancelled": False}
+    t0 = _time.time()
 
     def view():
         bar_.completed = state["f"] * 100
+        elapsed = _time.time() - t0
+        f = state["f"]
+        if f > 0.05:
+            eta = (elapsed / f) * (1.0 - f)
+            time_str = f"{elapsed:.0f}s elapsed  —  ETA ~{eta:.0f}s"
+        else:
+            time_str = f"{elapsed:.0f}s elapsed"
+        hint = (
+            Text("Cancellation requested... aborting", style="bold yellow")
+            if state["cancelled"]
+            else Text.assemble(key("Esc", th), " Cancel extraction", style="dim")
+        )
         return Panel(
             Group(
                 Text.assemble(
@@ -684,36 +885,84 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
                 Text(""),
                 bar_,
                 Text(f"{state['f'] * 100:5.1f}%  {state['msg']}", style=f"bold {th.primary}"),
+                Text(time_str, style="dim"),
+                Text(""),
+                hint,
             ),
             title=f"[bold {th.accent}]Extracting Speech-Free Room Noise Profile[/]",
             border_style=th.border,
             box=box.ROUNDED,
         )
 
-    result = None
-    with Live(view(), console=console, refresh_per_second=8) as live:
-        def cb(msg: str, f: float):
-            state["msg"], state["f"] = msg, f
-            live.update(view())
+    res_box: dict[str, Any] = {"result": None, "error": None, "done": False}
 
+    def worker():
         try:
-            cb("Loading main audio...", 0.05)
-            main_audio, sr = load_audio(cfg.main, mono=True)
-            cb("Analyzing acoustic timeline...", 0.15)
+            size_mb = cfg.main.stat().st_size / 1_048_576
+            cb(f"Loading main audio ({size_mb:.0f} MB)...", 0.03)
+            main_audio, audio_sr = load_audio(cfg.main, mono=True)
+            if cancel_ev.is_set():
+                raise InterruptedError("Cancelled")
+            dur_s = len(main_audio) / audio_sr
+            m, s = divmod(int(dur_s), 60)
+            cb(f"Audio loaded ({m:02d}:{s:02d} at {audio_sr // 1000}kHz) — starting scan...", 0.08)
+
+            def _scan_cb(msg: str, f: float) -> None:
+                cb(msg, 0.08 + f * 0.84)
+
             res = extract_noise_profile(
                 main_audio,
-                sr=sr,
+                sr=audio_sr,
                 n_chunks=n_chunks,
                 chunk_sec=chunk_sec,
                 mode=modes[mode_idx][0],
-                progress=cb,
+                progress=_scan_cb,
+                cancel_event=cancel_ev,
             )
+            if cancel_ev.is_set():
+                raise InterruptedError("Cancelled")
             out_noise_path = cfg.default_noise_output()
-            save_audio(out_noise_path, res.audio, sr)
+            save_audio(out_noise_path, res.audio, audio_sr)
             res.output_path = out_noise_path
-            result = res
+            res_box["result"] = res
+        except InterruptedError:
+            pass
         except Exception as e:
-            result = e
+            res_box["error"] = e
+        finally:
+            res_box["done"] = True
+
+    result = None
+    live_active = True
+    with Live(view(), console=console, refresh_per_second=8) as live:
+        def cb(msg: str, f: float):
+            if not live_active:
+                return
+            state["msg"], state["f"] = msg, f
+            live.update(view())
+
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
+
+        while not res_box["done"]:
+            k = poll_key(timeout=0.05)
+            if k is not None and (k.name == "esc" or (k.name == "char" and k.char == "\x1b")):
+                state["cancelled"] = True
+                cancel_ev.set()
+                live.update(view())
+                break
+
+        live_active = False
+
+        if cancel_ev.is_set():
+            worker_thread.join(timeout=5.0)
+            return None
+
+        worker_thread.join(timeout=1.0)
+        if res_box["error"] is not None:
+            result = res_box["error"]
+        else:
+            result = res_box["result"]
 
     console.clear()
     if isinstance(result, Exception):
@@ -730,14 +979,11 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
         )
         while True:
             k = read_key()
-            if k and k.name == "enter":
+            if k and k.name in ("enter", "esc"):
                 break
         return None
 
-    cfg.reference = result.output_path
-    cfg.role = ReferenceRole.NOISY
-
-    while True:
+    def _build_preview_panel() -> Panel:
         play_st = player.status_text()
         env_display = getattr(result, "waveform_envelope", "")
         card_lines = [
@@ -771,21 +1017,35 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
                 key("P", th), " Play noise  ",
                 key("Space", th), " Stop playback  ",
                 key("C", th), " Theme  ",
-                key("Enter", th), " Accept & return"
+                key("Enter", th), " Accept & apply  ",
+                key("Esc", th), " Discard & back",
             )
         )
+        return Panel(
+            Group(*card_lines),
+            title=f"[bold {th.accent}]Room Noise Profile Successfully Extracted[/]",
+            border_style=th.border,
+            box=box.ROUNDED,
+        )
 
+    while True:
         console.clear()
-        console.print(
-            Panel(
-                Group(*card_lines),
-                title=f"[bold {th.accent}]Room Noise Profile Successfully Extracted[/]",
-                border_style=th.border,
-                box=box.ROUNDED,
-            )
-        )
+        if player.is_playing():
+            k = None
+            with Live(_build_preview_panel(), console=console, refresh_per_second=12, transient=True) as live:
+                while player.is_playing():
+                    live.update(_build_preview_panel())
+                    k = poll_key(timeout=0.08)
+                    if k is not None:
+                        break
+            if k is None:
+                console.clear()
+                console.print(_build_preview_panel())
+                k = read_key()
+        else:
+            console.print(_build_preview_panel())
+            k = read_key()
 
-        k = read_key()
         if k is None:
             continue
         if k.name == "char" and k.char.upper() == "P":
@@ -793,11 +1053,16 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
                 player.stop()
             else:
                 player.play(result.output_path, "Extracted Noise Profile")
-        elif k.name in ("space", "char") and (k.name == "space" or k.char in (" ", "s", "S")):
+        elif k.name == "space" or (k.name == "char" and k.char in (" ", "s", "S")):
             player.stop()
         elif k.name == "char" and k.char.lower() == "c":
             themes.cycle_theme()
             th = themes.get_theme()
-        elif k.name in ("enter", "esc"):
+        elif k.name == "enter":
             player.stop()
+            cfg.reference = result.output_path
+            cfg.role = ReferenceRole.NOISY
             return result.output_path
+        elif k.name == "esc":
+            player.stop()
+            return None

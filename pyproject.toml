@@ -16,7 +16,6 @@ dependencies = [
   "noisereduce>=3.0.3",
   "huggingface_hub>=0.26",
   "pysilero-vad>=3.4.0",
-  "webrtcvad-wheels>=2.0.14",
   "sounddevice>=0.5.0",
 ]
 

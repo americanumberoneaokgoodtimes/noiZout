@@ -41,30 +41,78 @@ class NoiseExtractionResult:
         )
 
 
-def _check_silero_speech(audio_16k: np.ndarray, max_threshold: float, mean_threshold: float) -> tuple[bool, float, float]:
-    """Test candidate chunk with Silero VAD in 512-sample (32ms) frames.
-    Returns (is_clean_noise, max_prob, mean_prob).
+def _load_vad_model():
+    """Load Silero VAD model, preferring zero-PyTorch pysilero_vad (ONNX/ggml).
+
+    Returns (tagged_model, optional_get_timestamps) or (None, None).
     """
     try:
         import pysilero_vad
-        detector = pysilero_vad.SileroVoiceActivityDetector()
+        return ("pysilero", pysilero_vad.SileroVoiceActivityDetector()), None
+    except Exception:
+        pass
+    try:
+        import torch  # noqa: F401
+        import silero_vad as _svad
+        return ("torch_silero", _svad.load_silero_vad()), _svad.get_speech_timestamps
+    except Exception:
+        return None, None
+
+
+def _check_silero_speech(
+    audio_16k: np.ndarray,
+    max_threshold: float,
+    mean_threshold: float,
+    vad_model=None,
+    get_timestamps=None,
+) -> tuple[bool, float, float]:
+    """Test candidate chunk with Silero VAD in 512-sample (32ms) frames.
+
+    Returns (is_clean_noise, max_prob, mean_prob).
+    """
+    try:
+        model = vad_model
+        if model is None:
+            model, _ = _load_vad_model()
+        if model is None:
+            return True, 0.0, 0.0
+
+        backend, inner = model if isinstance(model, tuple) and len(model) == 2 else ("pysilero", model)
         step = 512
         n_frames = len(audio_16k) // step
         if n_frames == 0:
             return False, 1.0, 1.0
 
-        probs = []
-        for i in range(n_frames):
-            frame = audio_16k[i * step : (i + 1) * step]
-            pcm16 = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-            probs.append(detector(pcm16))
+        if backend == "pysilero":
+            if hasattr(inner, "reset"):
+                inner.reset()
+            probs = []
+            for i in range(n_frames):
+                frame = audio_16k[i * step : (i + 1) * step]
+                pcm16 = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                probs.append(float(inner(pcm16)))
+            max_p = float(np.max(probs))
+            mean_p = float(np.mean(probs))
+            is_clean = (max_p <= max_threshold) and (mean_p <= mean_threshold)
+            return is_clean, max_p, mean_p
 
-        max_p = float(np.max(probs))
-        mean_p = float(np.mean(probs))
-        is_clean = (max_p <= max_threshold) and (mean_p <= mean_threshold)
-        return is_clean, max_p, mean_p
+        if backend == "torch_silero":
+            import torch
+            if hasattr(inner, "reset_states"):
+                inner.reset_states()
+            probs = []
+            with torch.no_grad():
+                for i in range(n_frames):
+                    frame = audio_16k[i * step : (i + 1) * step].astype(np.float32)
+                    t = torch.from_numpy(frame).unsqueeze(0)
+                    probs.append(float(inner(t, 16000).item()))
+            max_p = float(np.max(probs))
+            mean_p = float(np.mean(probs))
+            is_clean = (max_p <= max_threshold) and (mean_p <= mean_threshold)
+            return is_clean, max_p, mean_p
+
+        return True, 0.0, 0.0
     except Exception:
-        # If VAD model fails to load, allow fallback
         return True, 0.0, 0.0
 
 
@@ -110,17 +158,32 @@ def _scan_for_noise_chunks(
     max_vad_prob: float,
     mean_vad_prob: float,
     min_gap_sec: float,
+    progress: Progress | None = None,
+    _vad_model=None,
+    _get_timestamps=None,
+    cancel_event=None,
 ) -> list[dict]:
     """Scan audio for candidate windows of `chunk_sec` that pass the Silero VAD speech filter."""
     chunk_samples = int(chunk_sec * sr)
     min_gap_samples = int(min_gap_sec * sr)
     stride = max(int(0.25 * chunk_samples), 1)
     n_windows = max(1, (len(audio) - chunk_samples) // stride + 1)
+    p = progress or (lambda *_: None)
+
+    # Load VAD model once for all candidates in this scan pass
+    vad_model, get_timestamps = _vad_model, _get_timestamps
+    if vad_model is None:
+        vad_model, get_timestamps = _load_vad_model()
 
     candidates = []
     hop_energy = int(0.025 * sr)
 
+    # Phase 1: energy scan (fast) — emit progress per window
     for w_idx in range(n_windows):
+        if cancel_event is not None and w_idx % 50 == 0 and cancel_event.is_set():
+            raise InterruptedError("Cancelled")
+        if n_windows > 1:
+            p(f"Energy scan: window {w_idx + 1}/{n_windows}", (w_idx + 1) / n_windows * 0.55)
         st = w_idx * stride
         en = st + chunk_samples
         seg = audio[st:en]
@@ -159,15 +222,26 @@ def _scan_for_noise_chunks(
     # Sort candidates by lowest energy / most stationary first
     candidates.sort(key=lambda c: c["score"], reverse=True)
 
+    # Phase 2: VAD validation of top candidates (slower) — emit progress per candidate
+    n_cands = len(candidates)
     selected = []
-    for cand in candidates:
+    for c_idx, cand in enumerate(candidates):
+        if n_cands > 0:
+            p(
+                f"VAD check: candidate {c_idx + 1}/{n_cands} at {cand['start_sec']:.1f}s",
+                0.55 + (c_idx + 1) / n_cands * 0.45,
+            )
+
         if any(abs(cand["start"] - s["start"]) < min_gap_samples for s in selected):
             continue
 
         seg = audio[cand["start"] : cand["end"]]
         seg_16k = resample(seg, sr, 16000)
 
-        is_clean, max_p, mean_p = _check_silero_speech(seg_16k, max_vad_prob, mean_vad_prob)
+        is_clean, max_p, mean_p = _check_silero_speech(
+            seg_16k, max_vad_prob, mean_vad_prob,
+            vad_model=vad_model, get_timestamps=get_timestamps,
+        )
         if not is_clean:
             continue
 
@@ -189,6 +263,7 @@ def extract_noise_profile(
     mode: Literal["balanced", "deep", "fast"] = "balanced",
     min_gap_sec: float = 1.5,
     progress: Progress | None = None,
+    cancel_event=None,
 ) -> NoiseExtractionResult:
     """Scan audio for candidate room-noise sections with lowest signal-to-noise ratio,
     validate with strict Silero VAD to guarantee no speech fragments, and crossfade
@@ -201,8 +276,6 @@ def extract_noise_profile(
     if total_sec < 0.5:
         raise ValueError(f"Audio is too short ({total_sec:.2f}s) to extract noise profile.")
 
-    p("Scanning audio timeline for room noise candidates", 0.1)
-
     # VAD sensitivity settings
     if mode == "deep":
         max_vad, mean_vad = 0.06, 0.02
@@ -211,28 +284,54 @@ def extract_noise_profile(
     else:  # fast
         max_vad, mean_vad = 0.18, 0.08
 
-    # Attempt 1: search at requested chunk_sec
+    # Load VAD model once — reused across all scan attempts
+    p("Loading VAD model...", 0.02)
+    vad_model, get_timestamps = _load_vad_model()
+    if vad_model is None:
+        warnings.append("Silero VAD unavailable; using energy-stationarity noise detection only.")
+
+    def _sub(lo: float, hi: float) -> Progress:
+        """Return a progress callback that maps [0,1] into [lo,hi] of p."""
+        def _inner(msg: str, f: float) -> None:
+            p(msg, lo + f * (hi - lo))
+        return _inner
+
+    # Attempt 1: search at requested chunk_sec — occupies 0.05..0.65
     target_len_sec = n_chunks * chunk_sec
     cur_chunk_sec = min(chunk_sec, max(0.5, total_sec / (n_chunks + 1)))
-    selected = _scan_for_noise_chunks(audio, sr, n_chunks, cur_chunk_sec, max_vad, mean_vad, min_gap_sec)
+    p(f"Scanning timeline for noise candidates ({total_sec:.0f}s audio)...", 0.05)
+    selected = _scan_for_noise_chunks(
+        audio, sr, n_chunks, cur_chunk_sec, max_vad, mean_vad, min_gap_sec,
+        progress=_sub(0.05, 0.65),
+        _vad_model=vad_model, _get_timestamps=get_timestamps,
+        cancel_event=cancel_event,
+    )
 
-    # Attempt 2: if not enough chunks found, adaptively reduce chunk size to catch shorter pauses
+    # Attempt 2: adaptively reduce chunk size to catch shorter pauses — occupies 0.65..0.78
     if len(selected) < n_chunks and cur_chunk_sec > 0.8:
-        p("Adapting chunk search window to detect shorter pauses", 0.4)
+        p("Adapting chunk size to detect shorter pauses...", 0.65)
         smaller_chunk_sec = max(0.5, cur_chunk_sec * 0.5)
         needed_chunks = int(math.ceil(target_len_sec / smaller_chunk_sec))
         more_selected = _scan_for_noise_chunks(
-            audio, sr, needed_chunks, smaller_chunk_sec, max_vad, mean_vad, min_gap_sec=max(0.5, min_gap_sec * 0.5)
+            audio, sr, needed_chunks, smaller_chunk_sec, max_vad, mean_vad,
+            min_gap_sec=max(0.5, min_gap_sec * 0.5),
+            progress=_sub(0.65, 0.78),
+            _vad_model=vad_model, _get_timestamps=get_timestamps,
+            cancel_event=cancel_event,
         )
         if len(more_selected) > len(selected):
             selected = more_selected
 
-    # Attempt 3: if still not found, relax VAD threshold slightly if in balanced mode
+    # Attempt 3: relax VAD threshold — occupies 0.78..0.85
     if len(selected) == 0 and mode != "deep":
-        p("Retrying with relaxed sensitivity threshold", 0.6)
+        p("Retrying with relaxed sensitivity threshold...", 0.78)
         warnings.append("High ambient noise or continuous speech detected; sensitivity was slightly adapted.")
         selected = _scan_for_noise_chunks(
-            audio, sr, n_chunks, max(0.5, cur_chunk_sec * 0.5), max_vad * 1.8, mean_vad * 1.8, min_gap_sec=0.5
+            audio, sr, n_chunks, max(0.5, cur_chunk_sec * 0.5), max_vad * 1.8, mean_vad * 1.8,
+            min_gap_sec=0.5,
+            progress=_sub(0.78, 0.85),
+            _vad_model=vad_model, _get_timestamps=get_timestamps,
+            cancel_event=cancel_event,
         )
 
     if not selected:
@@ -241,13 +340,12 @@ def extract_noise_profile(
             "The audio may contain continuous sound or very high speech density without pauses."
         )
 
-    # 3. Cross-chunk spectral consistency check (reject anomalous outliers like clicks)
+    # Cross-chunk spectral consistency check — occupies 0.85..0.90
     if len(selected) >= 3:
-        p("Checking spectral consistency across noise chunks", 0.75)
+        p("Checking spectral consistency across noise chunks...", 0.85)
         spec_list = []
         for s in selected:
             seg = audio[s["start"] : s["end"]]
-            # 512-point FFT magnitude
             fft_mag = np.abs(np.fft.rfft(seg[: min(len(seg), 2048)]))
             fft_mag /= (np.linalg.norm(fft_mag) + 1e-9)
             spec_list.append(fft_mag)
@@ -258,17 +356,15 @@ def extract_noise_profile(
         consistent = []
         for s, smag in zip(selected, spec_list):
             corr = float(np.dot(smag, median_spec))
-            if corr >= 0.55:  # retains consistent noise, filters sudden transient bangs
+            if corr >= 0.55:
                 consistent.append(s)
 
         if len(consistent) >= 2:
             selected = consistent
 
-    # Sort selected chunks chronologically by timeline
     selected.sort(key=lambda s: s["start"])
 
-    p("Concatenating and crossfading noise profile", 0.9)
-
+    p("Concatenating and crossfading noise profile...", 0.92)
     raw_chunks = [audio[s["start"] : s["end"]] for s in selected]
     final_audio = _crossfade_concat(raw_chunks, sr, xfade_ms=25.0)
 

@@ -120,6 +120,7 @@ def render(state: PickerState, title: str, typing_filter: bool, height: int, the
     t.add_column("Info", ratio=3, no_wrap=True)
     rows = max(5, height - 12)
     start = max(0, min(state.index - rows // 2, len(state.entries) - rows))
+    _cached_probe = None  # probe result for selected entry — reused in preview section below
     for i in range(start, min(len(state.entries), start + rows)):
         e = state.entries[i]
         sel = i == state.index
@@ -129,6 +130,8 @@ def render(state: PickerState, title: str, typing_filter: bool, height: int, the
             ext = e.path.suffix.lower().lstrip(".").upper()
             typ, style = f"[{ext}]", f"bold {th.accent}"
             ai = probe_audio(e.path) if sel else None
+            if sel:
+                _cached_probe = ai
             try:
                 size = e.path.stat().st_size / 1024
                 info = f"{size / 1024:.1f} MB" if size > 1024 else f"{size:.0f} KB"
@@ -155,7 +158,7 @@ def render(state: PickerState, title: str, typing_filter: bool, height: int, the
         sel_path = state.entries[state.index].path
         try:
             env_str = get_file_waveform_envelope(sel_path, width=20)
-            ai_sel = probe_audio(sel_path)
+            ai_sel = _cached_probe
             dur_str = f" ({ai_sel.short()})" if ai_sel else ""
             if env_str:
                 preview_text = Text.assemble(

@@ -486,7 +486,8 @@ def test_zero_forbidden_framework_audit():
         for f in files:
             if f.endswith(".py"):
                 full_path = Path(root) / f
-                if full_path.resolve() == Path(__file__).resolve():
+                # Skip test files — they may mention the forbidden name in their own constraint checks
+                if full_path.resolve().parent.name == "tests":
                     continue
                 content = full_path.read_text(encoding="utf-8", errors="ignore").lower()
                 if target_str in content:
