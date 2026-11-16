@@ -14,31 +14,30 @@ tests, deterministic synthetic fixtures, and progressive testability markers.
 ## Current Test Status
 
 ```
-tests/test_zout.py  :  32 passed,  0 failed
+tests/test_zout.py  :  40 passed,  0 failed
 tests/test_e2e.py   :  93 passed,  0 failed
-─────────────────────────────────────────────────────────────
-Total               : 125 passed,  0 failed  ✅ 100%
+Full suite (tests/) : 241 passed,  0 failed  ✅ 100%
 ```
 
 ---
 
 ## Test Execution Command
 
-Run the complete test suite:
+Run the complete repository test suite:
 
 ```bash
-pytest tests/test_zout.py tests/test_e2e.py -v
+pytest tests/ -v
 ```
 
 Execution characteristics:
-- **Total Test Cases**: 125 (32 unit + 93 E2E)
-- **Execution Time**: ~2 minutes (noisereduce KL-NMF is compute-intensive)
+- **Total Test Cases**: 241 (40 unit + 93 E2E + 108 Tier-5 hardening & M1-M3 stress/adversarial tests)
+- **Execution Time**: ~2–3 minutes (noisereduce KL-NMF & streaming stress suites)
 - **Network Access**: 0 downloads required (100% offline synthetic fixtures)
 - **Audio Hardware**: Headless-safe (`MockOutputStream` when audio device absent)
 
-To run only the E2E suite:
+To run only the unit & E2E suites:
 ```bash
-pytest tests/test_e2e.py -v
+pytest tests/test_zout.py tests/test_e2e.py -v
 ```
 
 ---
@@ -49,11 +48,11 @@ pytest tests/test_e2e.py -v
 |-------------------|--------------------|----------|----------------------------------------|
 | `noisereduce`     | NOISY mode         | ✅ OK    | `pip install noisereduce`              |
 | `voxlock`         | CLEAN mode         | ✅ OK    | `pip install voxlock`                  |
-| `silero_vad`      | Forensic audit VAD | ✅ OK    | `pip install silero-vad`               |
+| `pysilero_vad`    | Auto-noise & Audit VAD | ✅ OK | `pip install pysilero-vad`            |
 | `sounddevice`     | Audio playback     | ✅ OK    | `pip install sounddevice`              |
 | `ffmpeg`+`ffprobe`| MP3/M4A/AAC        | ✅ OK    | system package                         |
-| `deepfilternet_slim` | Polish (C runtime) | ❌ MISSING | private; see project docs          |
-| `deepfilter_stream`  | Polish (ONNX fallback) | ✅ OK  | `pip install deepfilter-stream`    |
+| `deepfilternet_slim` | Polish (C runtime) | ✅ OK | private package (active C runtime)     |
+| `deepfilter_stream`  | Polish (ONNX fallback) | Optional | `pip install deepfilter-stream`    |
 
 Run `zout --check-deps` to get a live report at any time.
 
@@ -61,9 +60,8 @@ Run `zout --check-deps` to get a live report at any time.
 
 ## Known Limitations
 
-**`deepfilternet_slim`** — The private C runtime polish backend is not installed. The public
-`deepfilter-stream` ONNX fallback is active instead, so the polish stage runs normally.
-Install `deepfilternet-slim` to use the C runtime backend (see project docs).
+**`deepfilter_stream`** — The optional public ONNX fallback is not installed in `.venv` because
+the native `deepfilternet_slim` C runtime is installed and active for DeepFilterNet3 polishing.
 
 ---
 

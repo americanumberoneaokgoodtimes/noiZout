@@ -20,7 +20,7 @@ C:\Users\o\Desktop\git\zout\
 ├── TEST_INFRA.md               # Test infrastructure architecture (this document)
 ├── TEST_READY.md               # Test execution summary & coverage matrix
 ├── tests/
-│   ├── test_zout.py            # Existing unit & baseline regression tests (8 tests)
+│   ├── test_zout.py            # Unit & baseline regression tests (40 tests)
 │   └── test_e2e.py             # 4-Tier comprehensive E2E test suite (93 tests)
 └── zout/                       # Application source tree
     ├── app.py                  # CLI parser & TUI loop
@@ -37,7 +37,7 @@ C:\Users\o\Desktop\git\zout\
 
 ### 3.1 Python Virtual Environment
 - **Python Version**: 3.10+
-- **Key Test Libraries**: `pytest`, `soundfile`, `soxr`, `numpy`, `rich`, `silero-vad`, `noisereduce`
+- **Key Test Libraries**: `pytest`, `soundfile`, `soxr`, `numpy`, `rich`, `pysilero-vad`, `noisereduce`
 - **Optional (required for CLEAN mode tests)**: `voxlock` (no public install path — see project docs)
 
 ### 3.2 Primary Test Execution Commands
