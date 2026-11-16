@@ -26,6 +26,7 @@ from ..audio.io import (
 from ..audio.noise_extractor import extract_noise_profile, extract_noise_profile_from_file
 from ..audio.player import player
 from ..config import JobConfig, ReferenceRole, collect_deps_status
+from ..engines.noisy_engine import MAX_SAMPLES_PER_CHUNK, effective_streaming_window
 from ..pipeline import Result, run_job
 from . import themes
 from .keys import poll_key, read_key
@@ -209,8 +210,21 @@ def dashboard(cfg: JobConfig, msg: str = "", theme: themes.Theme | None = None) 
                                                              f"  {atten_label(cfg.max_atten_db)}"))
     t.add_row(key("F", th), "DeepFilterNet3 polish", Text("ON" if cfg.use_polish() else "OFF",
                                                           style=f"bold {th.success}" if cfg.use_polish() else "bold red"))
-    t.add_row(Text("  ", style="dim"), "Streaming window",
-              Text(f"{cfg.chunk_duration:.0f}s chunk / {cfg.overlap_duration:.1f}s overlap  [Press 3/4 to edit]", style="dim"))
+    eff_chunk, eff_ov, was_capped = effective_streaming_window(
+        cfg.chunk_duration, cfg.overlap_duration, 48000, cfg.max_chunk_samples
+    )
+    if was_capped:
+        stream_win_txt = Text.assemble(
+            (f"{cfg.chunk_duration:.0f}s chunk / {cfg.overlap_duration:.1f}s overlap", "dim"),
+            (f"  -> effective {eff_chunk:.1f}s / {eff_ov:.2f}s @ 48kHz ({cfg.max_chunk_samples // 1000}k-sample cap)", f"bold {th.accent}"),
+            ("  [3/4]", "dim"),
+        )
+    else:
+        stream_win_txt = Text(
+            f"{cfg.chunk_duration:.0f}s chunk / {cfg.overlap_duration:.1f}s overlap ({cfg.max_chunk_samples // 1000}k-sample cap)  [Press 3/4 to edit]",
+            style="dim",
+        )
+    t.add_row(Text("  ", style="dim"), "Streaming window", stream_win_txt)
     if cfg.batch_dir is not None:
         out_dir = cfg.out_dir or (cfg.batch_dir / "processed")
         t.add_row(key("O", th), "Output directory", Text(str(out_dir), style="dim"))
@@ -230,18 +244,20 @@ def dashboard(cfg: JobConfig, msg: str = "", theme: themes.Theme | None = None) 
 
     cfgp = Panel(t, title="[bold]Pipeline Configuration[/]", border_style=th.border, box=box.ROUNDED)
 
-    ctl1 = Text.assemble(
+    ctl1_top = Text.assemble(
         key("1", th), " Ref  ",
         key("M", th), " Mode  ",
         key("2", th), " Main  ",
+        key("B", th), " Batch  ",
         key("T", th), " Range  ",
         key("N", th), " Noise  ",
-        key("A", th), " Audit  ",
+        key("O", th), " Out",
+    )
+    ctl1_bot = Text.assemble(
         key("3/4", th), " Params  ",
         key("F", th), " Polish  ",
+        key("A", th), " Audit  ",
         key("C", th), " Theme  ",
-        key("B", th), " Batch  ",
-        key("O", th), " Out  ",
         key("D", th), " Deps",
     )
     ctl2 = Text.assemble(
@@ -257,7 +273,7 @@ def dashboard(cfg: JobConfig, msg: str = "", theme: themes.Theme | None = None) 
         else Text("Ready — press R to process." if ready else "Pick a reference (1) or Auto-extract noise (N), and a main recording (2) or batch (B).",
                   style=f"bold {th.success}" if ready else "dim")
     )
-    foot = Panel(Group(ctl1, ctl2, Text(""), status_line),
+    foot = Panel(Group(ctl1_top, ctl1_bot, ctl2, Text(""), status_line),
                  title="[bold]Controls[/]", border_style=th.border, box=box.ROUNDED)
     return Group(head, cfgp, foot)
 
@@ -319,10 +335,18 @@ def _make_param_row(i: int, current_field: int, title: str, widget: Text, hints:
 
 def prompt_params(console: Console, cfg: JobConfig, theme: themes.Theme | None = None) -> None:
     th = theme or themes.get_theme()
-    orig = (cfg.strength, cfg.max_atten_db, cfg.chunk_duration, cfg.overlap_duration)
+    orig = (cfg.strength, cfg.max_atten_db, cfg.chunk_duration, cfg.overlap_duration, cfg.max_chunk_samples)
     field = 0
     while True:
         max_ov = min(15.0, max(0.0, round(cfg.chunk_duration * 0.49, 1)))
+        eff_c, eff_o, capped = effective_streaming_window(
+            cfg.chunk_duration, cfg.overlap_duration, 48000, cfg.max_chunk_samples
+        )
+        cap_note = (
+            f"Effective @ 48kHz: {eff_c:.1f}s chunk / {eff_o:.2f}s overlap (capped by item 5; raise item 5 for wider chunks)"
+            if capped
+            else f"Effective @ 48kHz: {eff_c:.1f}s chunk / {eff_o:.2f}s overlap (within sample ceiling)"
+        )
         body = Group(
             _make_param_row(
                 0, field, "1. Strength (adaptive threshold / power)",
@@ -337,12 +361,20 @@ def prompt_params(console: Console, cfg: JobConfig, theme: themes.Theme | None =
             _make_param_row(
                 2, field, "3. Streaming chunk duration",
                 Text.assemble(bar(cfg.chunk_duration, 5.0, 120.0, color=th.primary, theme=th), f"  {cfg.chunk_duration:.0f} s"),
-                "Block window for disk-to-disk streaming (5s - 120s). [D]60s default",
+                f"Target block window (5s - 120s). [D]60s default. {cap_note}",
             ),
             _make_param_row(
                 3, field, "4. Streaming overlap duration",
                 Text.assemble(bar(cfg.overlap_duration, 0.0, max(1.0, max_ov), color=th.success, theme=th), f"  {cfg.overlap_duration:.1f} s"),
-                f"Raised-cosine crossfade overlap (0.0s - {max_ov:.1f}s). [D]2.0s default",
+                f"Raised-cosine crossfade overlap (0.0s - {max_ov:.1f}s, max 25% of effective chunk). [D]2.0s default",
+            ),
+            _make_param_row(
+                4, field, "5. Per-chunk sample ceiling (RAM guard)",
+                Text.assemble(
+                    bar(min(cfg.max_chunk_samples, 2_880_000), 240_000, 2_880_000, color=th.accent, theme=th),
+                    f"  {cfg.max_chunk_samples:,} samples (~{cfg.max_chunk_samples / 48000:.1f}s @ 48kHz)",
+                ),
+                "[D]240k (<75MB RAM)  [M]720k (15s)  [H]1.44M (30s)  [X]2.88M (60s @ 48kHz)",
             ),
             Text.assemble(key("Tab/↑/↓", th), " switch  ", key("←/→", th), " adjust  ", key("Enter", th), " confirm  ", key("Esc", th), " cancel"),
         )
@@ -352,9 +384,9 @@ def prompt_params(console: Console, cfg: JobConfig, theme: themes.Theme | None =
         if k is None:
             continue
         if k.name in ("tab", "down"):
-            field = (field + 1) % 4
+            field = (field + 1) % 5
         elif k.name == "up":
-            field = (field - 1) % 4
+            field = (field - 1) % 5
         elif k.name in ("left", "right"):
             d = 1 if k.name == "right" else -1
             if field == 0:
@@ -369,6 +401,8 @@ def prompt_params(console: Console, cfg: JobConfig, theme: themes.Theme | None =
                     cfg.overlap_duration = cap_ov
             elif field == 3:
                 cfg.overlap_duration = round(min(max_ov, max(0.0, cfg.overlap_duration + 0.5 * d)), 1)
+            elif field == 4:
+                cfg.max_chunk_samples = int(min(5_760_000, max(48_000, cfg.max_chunk_samples + 120_000 * d)))
         elif k.name == "char":
             c = k.char.lower()
             if field == 1:
@@ -379,10 +413,14 @@ def prompt_params(console: Console, cfg: JobConfig, theme: themes.Theme | None =
                 cfg.chunk_duration = 60.0
             elif field == 3 and c == "d":
                 cfg.overlap_duration = min(2.0, max_ov)
+            elif field == 4:
+                cap_preset = {"d": 240_000, "m": 720_000, "h": 1_440_000, "x": 2_880_000}.get(c)
+                if cap_preset:
+                    cfg.max_chunk_samples = cap_preset
         elif k.name == "enter":
             return
         elif k.name == "esc":
-            cfg.strength, cfg.max_atten_db, cfg.chunk_duration, cfg.overlap_duration = orig
+            cfg.strength, cfg.max_atten_db, cfg.chunk_duration, cfg.overlap_duration, cfg.max_chunk_samples = orig
             return
 
 
@@ -806,8 +844,14 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
     modes = [("balanced", "Balanced (VAD + Flatness) [Recommended]"),
              ("deep", "Deep Hunt (Strict - Catches Low-Energy Whispers)"),
              ("fast", "Fast (Quick Energy Scan + VAD)")]
+    scan_idx = 0
+    scan_modes = [
+        ("auto", "Auto (Fast distributed probe on >10m recordings) [Recommended]"),
+        ("sampled", "Sampled Fast Scan (Distributed windows across file)"),
+        ("full", "Full Sequential Scan (Every block — thorough)"),
+    ]
 
-    field = 0  # 0: n_chunks, 1: chunk_sec, 2: mode
+    field = 0  # 0: n_chunks, 1: chunk_sec, 2: mode, 3: scan_mode
 
     while True:
         body = Group(
@@ -821,6 +865,9 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
             _make_param_row(2, field, "Extraction Strategy",
                 Text(f"● {modes[mode_idx][1]}", style=f"bold {th.accent}"),
                 "[B] Balanced  [D] Deep Hunt (ultra-strict VAD)  [F] Fast scan"),
+            _make_param_row(3, field, "Long-File Scan Coverage",
+                Text(f"● {scan_modes[scan_idx][1]}", style=f"bold {th.primary}"),
+                "[A] Auto  [S] Sampled fast scan  [U] Full sequential scan"),
             Text.assemble(
                 key("Tab", th), " switch field  ",
                 key("←/→", th), " adjust  ",
@@ -836,7 +883,7 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
             continue
         if k.name in ("tab", "up", "down"):
             d = 1 if (k.name == "tab" or k.name == "down") else -1
-            field = (field + d) % 3
+            field = (field + d) % 4
         elif k.name in ("left", "right"):
             d = 1 if k.name == "right" else -1
             if field == 0:
@@ -845,6 +892,8 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
                 chunk_sec = round(max(0.5, min(10.0, chunk_sec + 0.5 * d)), 1)
             elif field == 2:
                 mode_idx = (mode_idx + d) % len(modes)
+            elif field == 3:
+                scan_idx = (scan_idx + d) % len(scan_modes)
         elif k.name == "char":
             c = k.char.lower()
             if field == 0 and c in "123456789":
@@ -857,6 +906,12 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
                 mode_idx = 1
             elif c == "f":
                 mode_idx = 2
+            elif c == "a":
+                scan_idx = 0
+            elif c == "s":
+                scan_idx = 1
+            elif c == "u":
+                scan_idx = 2
         elif k.name == "esc":
             return None
         elif k.name == "enter":
@@ -917,6 +972,7 @@ def prompt_auto_noise(console: Console, cfg: JobConfig, theme: themes.Theme | No
                 end_sec=cfg.end_sec,
                 progress=_scan_cb,
                 cancel_event=cancel_ev,
+                scan_mode=scan_modes[scan_idx][0],
             )
             if cancel_ev.is_set():
                 raise InterruptedError("Cancelled")

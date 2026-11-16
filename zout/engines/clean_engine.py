@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from scipy.ndimage import uniform_filter1d
 
-from ..audio.io import prepare_clean_enrollment, resample
+from ..audio.io import prepare_clean_enrollment, resample, resolve_writable_output_path
 from ..audio.masking import N_FFT, _istft, _stft, apply_adaptive_mask
 from .noisy_engine import MAX_SAMPLES_PER_CHUNK, _run_with_min_length, _stream_disk_to_disk
 
@@ -120,6 +120,7 @@ class CleanVoiceEngine:
         start_sec: float | None = None,
         end_sec: float | None = None,
         cancel_event: threading.Event | None = None,
+        max_chunk_samples: int = MAX_SAMPLES_PER_CHUNK,
     ) -> tuple[Path, dict]:
         p = progress or (lambda *_: None)
         info: dict = {}
@@ -186,9 +187,11 @@ class CleanVoiceEngine:
             end_sec=end_sec,
             progress=_chunk_progress,
             cancel_event=cancel_event,
+            max_chunk_samples=max_chunk_samples,
         )
+        resolved_out = Path(stats.pop("output_path", resolve_writable_output_path(out_path)))
         info.update(stats)
-        return Path(out_path), info
+        return resolved_out, info
 
 
     @staticmethod

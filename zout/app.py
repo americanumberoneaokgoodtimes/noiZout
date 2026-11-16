@@ -37,6 +37,7 @@ def _cli(args) -> int:
 
     if args.auto_noise and main_path:
         size_mb = main_path.stat().st_size / 1_048_576
+        scan_mode = getattr(args, "noise_scan", "auto")
         if not args.quiet:
             with Progress(console=console) as _pg:
                 _task = _pg.add_task(f"Scanning audio ({size_mb:.0f} MB) for noise...", total=100)
@@ -48,6 +49,7 @@ def _cli(args) -> int:
                     start_sec=start_sec,
                     end_sec=end_sec,
                     progress=lambda msg, f: _pg.update(_task, completed=f * 100, description=msg),
+                    scan_mode=scan_mode,
                 )
         else:
             noise_res = extract_noise_profile_from_file(
@@ -57,6 +59,7 @@ def _cli(args) -> int:
                 mode=args.noise_mode,
                 start_sec=start_sec,
                 end_sec=end_sec,
+                scan_mode=scan_mode,
             )
         save_path = Path(args.save_noise) if args.save_noise else main_path.with_name(main_path.stem + "_noise_profile.wav")
         save_audio(save_path, noise_res.audio, noise_res.sr)
@@ -84,6 +87,7 @@ def _cli(args) -> int:
         audit_path=audit_path,
         batch_dir=batch_dir,
         out_dir=out_dir,
+        max_chunk_samples=getattr(args, "max_chunk_samples", 240_000),
     )
 
     if args.quiet:
@@ -192,7 +196,7 @@ def _interactive() -> int:
                     cfg.main = p
                     cfg.batch_dir = None
                     cfg.output = None
-                    screens.prompt_params(console, cfg, theme=cur_th)
+                    msg = f"Main recording set: {p.name} — press 3/4 for Params, N for Noise, T for Range, or R to RUN."
             elif c.lower() == "t":
                 player.stop()
                 screens.prompt_timeline_range(console, cfg, theme=cur_th)
@@ -377,10 +381,13 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--polish", choices=["auto", "on", "off"], default="auto",
                     help="DeepFilterNet3 speech polish (auto: on, off)")
     ap.add_argument("--chunk-duration", type=float, default=60.0, metavar="SEC",
-                    help="streaming chunk duration in seconds (default 60.0)")
+                    help="target streaming chunk duration in seconds (default 60.0; bounded by --max-chunk-samples)")
     ap.add_argument("--overlap-duration", type=float, default=2.0, metavar="SEC",
-                    help="streaming raised-cosine overlap duration in seconds (default 2.0)")
-    ap.add_argument("-o", "--out", metavar="FILE", help="output file (default: <main>_zout.wav)")
+                    help="streaming raised-cosine overlap duration in seconds (default 2.0; max 25%% of effective chunk)")
+    ap.add_argument("--max-chunk-samples", type=int, default=240_000, metavar="SAMPLES",
+                    help="per-chunk sample ceiling for streaming RAM control (default 240000 = 5.0s @ 48kHz, <75MB RAM)")
+    ap.add_argument("-o", "--out", metavar="FILE",
+                    help="output file (default: <main>_zout.wav; native write formats: .wav, .flac, .ogg)")
     ap.add_argument("-q", "--quiet", action="store_true", help="no progress bar; print only the output path")
     ap.add_argument("-V", "--version", action="version", version=f"zout {__version__}")
     ap.add_argument("--check-deps", action="store_true",
@@ -418,6 +425,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="duration of each noise chunk in seconds (default 2.0)")
     ag.add_argument("--noise-mode", choices=["balanced", "deep", "fast"], default="balanced",
                     help="noise extraction strategy (default: balanced)")
+    ag.add_argument("--noise-scan", choices=["auto", "sampled", "full"], default="auto",
+                    help="long-recording scan coverage: auto (sampled >10m), sampled (fast distributed windows), or full (sequential)")
     ag.add_argument("--save-noise", metavar="FILE",
                     help="destination path for auto-extracted noise profile WAV")
     return ap
@@ -483,6 +492,8 @@ def _validate(ap: argparse.ArgumentParser, args) -> None:
         ap.error("--overlap-duration cannot be negative")
     if getattr(args, "overlap_duration", 2.0) >= getattr(args, "chunk_duration", 60.0):
         ap.error("--overlap-duration must be strictly less than --chunk-duration")
+    if getattr(args, "max_chunk_samples", 240_000) < 4096:
+        ap.error("--max-chunk-samples must be >= 4096")
     if getattr(args, "noise_chunks", 6) < 1:
         ap.error("--noise-chunks must be >= 1")
     if getattr(args, "noise_len", 2.0) < 0.5:

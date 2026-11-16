@@ -548,3 +548,175 @@ def test_strict_zero_textual_in_all_new_and_modified_files():
             elif isinstance(node, ast.ImportFrom):
                 if node.module:
                     assert "textual" not in node.module, f"Forbidden textual import in {py_file}"
+
+
+# ===========================================================================
+# 17. Streaming Non-Native Output Extension Parity & Audit Integrity
+# ===========================================================================
+
+def test_streaming_non_native_output_extension_returns_wav_and_warns_and_audits():
+    """Verify run_streaming with -o out.mp3 returns the written .wav path, records warning, and audits real audio."""
+    import json
+    from zout.pipeline import run_streaming
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        ref_f = root / "ref.wav"
+        main_f = root / "main.wav"
+        requested_out = root / "out.mp3"
+        sr = 48000
+        rng = np.random.default_rng(7)
+        sf.write(ref_f, (rng.standard_normal(sr * 2) * 0.05).astype(np.float32), sr)
+        t = np.linspace(0, 3.0, sr * 3, endpoint=False)
+        sig = (0.3 * np.sin(2 * np.pi * 440 * t) + rng.standard_normal(sr * 3) * 0.05).astype(np.float32)
+        sf.write(main_f, sig, sr)
+
+        cfg = JobConfig(
+            reference=ref_f,
+            role=ReferenceRole.NOISY,
+            main=main_f,
+            output=requested_out,
+            polish=False,
+            audit=True,
+        )
+        res = run_streaming(cfg)
+        assert res is not None
+        assert res.output.suffix == ".wav"
+        assert res.output.is_file()
+        assert not requested_out.exists()
+        assert "warning" in res.notes
+        assert ".mp3" in res.notes["warning"] and "saved as WAV" in res.notes["warning"]
+        assert res.audit_path is not None and res.audit_path.is_file()
+        manifest = json.loads(res.audit_path.read_text(encoding="utf-8"))
+        assert manifest["rms_dbfs"]["output"] > -60.0
+        assert manifest["true_peak_dbfs"]["output"] > -60.0
+
+
+# ===========================================================================
+# 18. Effective Streaming Window & Custom Max Chunk Samples
+# ===========================================================================
+
+def test_effective_streaming_window_and_custom_max_chunk_samples():
+    """Verify effective_streaming_window reports capping accurately and honors custom max_samples."""
+    from zout.engines.noisy_engine import effective_streaming_window
+
+    eff_c, eff_o, capped = effective_streaming_window(60.0, 2.0, 48000, max_samples=240_000)
+    assert capped is True
+    assert abs(eff_c - 5.0) < 1e-6
+    assert abs(eff_o - 1.25) < 1e-6
+
+    eff_c2, eff_o2, capped2 = effective_streaming_window(10.0, 2.0, 48000, max_samples=720_000)
+    assert capped2 is False
+    assert abs(eff_c2 - 10.0) < 1e-6
+    assert abs(eff_o2 - 2.0) < 1e-6
+
+    with pytest.raises(ValueError, match="max_chunk_samples"):
+        JobConfig(max_chunk_samples=1024)
+
+
+# ===========================================================================
+# 19. Dashboard Controls Layout & Capped Streaming Window Display
+# ===========================================================================
+
+def test_dashboard_controls_no_split_item_and_shows_effective_cap():
+    """Verify dashboard at 80 and 110 cols never splits '[B] Batch' across lines and shows effective cap."""
+    from io import StringIO
+    from rich.console import Console
+    from zout.tui import screens
+
+    cfg = JobConfig(chunk_duration=60.0, overlap_duration=2.0, max_chunk_samples=240_000)
+    for width in (80, 110):
+        buf = StringIO()
+        c = Console(file=buf, width=width, force_terminal=False, color_system=None)
+        c.print(screens.dashboard(cfg))
+        rendered = buf.getvalue()
+        assert "effective 5.0s" in rendered
+        assert "240k-sample cap" in rendered
+        for line in rendered.splitlines():
+            # Ensure 'B' key and 'Batch' label are on the same line whenever Batch is rendered
+            if "Batch" in line and "Controls" not in line and "Pick a reference" not in line:
+                assert " B  Batch" in line or "Batch folder" in line
+
+
+# ===========================================================================
+# 20. File Picker Single Waveform Preview (No Duplicate Table Info Envelope)
+# ===========================================================================
+
+def test_file_picker_no_duplicate_waveform_in_info_column():
+    """Verify file_picker renders Waveform Dynamics only in the bottom preview bar, not inside the table row."""
+    from io import StringIO
+    from rich.console import Console
+    from zout.tui import file_picker
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        wav = root / "sample.wav"
+        t = np.linspace(0, 1.0, 16000, endpoint=False)
+        sf.write(wav, (0.5 * np.sin(2 * np.pi * 220 * t)).astype(np.float32), 16000)
+
+        st = file_picker.PickerState(start=root)
+        st.refresh()
+        # Select sample.wav
+        for idx, entry in enumerate(st.entries):
+            if entry.path == wav:
+                st.index = idx
+                break
+
+        buf = StringIO()
+        c = Console(file=buf, width=110, height=28, force_terminal=False, color_system=None)
+        c.print(file_picker.render(st, "Pick Audio", 110, 28))
+        out = buf.getvalue()
+        assert "Waveform Dynamics: [" in out
+        # Find the row line containing sample.wav and ensure it has only 2 pipe separators (size | dur | sr | ch)
+        row_lines = [ln for ln in out.splitlines() if "sample.wav" in ln]
+        assert len(row_lines) == 1
+        assert row_lines[0].count("|") == 3  # e.g. "31 KB | 00:01 | 16kHz | Ch1"
+
+
+# ===========================================================================
+# 21. Sampled Fast Multi-Hour Auto-Noise Scan & Auto Fallback
+# ===========================================================================
+
+def test_sampled_noise_scan_multi_hour_and_auto_fallback(monkeypatch):
+    """Verify extract_noise_profile_from_file uses distributed probing on >600s files and falls back when needed."""
+    from zout.audio.io import AudioInfo
+    import zout.audio.noise_extractor as nx
+
+    with tempfile.TemporaryDirectory() as td:
+        wav = Path(td) / "long.wav"
+        sr = 16000
+        rng = np.random.default_rng(99)
+        room = (rng.standard_normal(sr * 12) * 0.02).astype(np.float32)
+        sf.write(wav, room, sr)
+
+        # Simulate a 3600s (1-hour) recording
+        monkeypatch.setattr(nx, "get_audio_info", lambda p: AudioInfo(3600.0, sr, 1, frames=3600 * sr))
+        probed_Windows: list[tuple[float | None, float | None]] = []
+
+        def fake_iter_chunks(path, chunk_sec=10.0, start_sec=None, end_sec=None, mono=True, cancel_event=None):
+            probed_Windows.append((start_sec, end_sec))
+            yield room, sr
+
+        monkeypatch.setattr(nx, "iter_audio_chunks", fake_iter_chunks)
+        monkeypatch.setattr(nx, "_load_vad_model", lambda: (None, None))
+
+        res = nx.extract_noise_profile_from_file(wav, n_chunks=4, chunk_sec=1.5, mode="fast", scan_mode="auto")
+        assert len(res.chunks) == 4
+        # Should have probed distributed windows (12 windows for n_chunks=4), NOT 120 sequential 30s blocks
+        assert 8 <= len(probed_Windows) <= 24
+        assert probed_Windows[0][0] == 0.0
+        assert probed_Windows[-1][0] > 3000.0
+
+
+# ===========================================================================
+# 22. CLI Parser Flags (--max-chunk-samples & --noise-scan)
+# ===========================================================================
+
+def test_cli_max_chunk_samples_and_noise_scan_flags():
+    """Verify _build_parser and _validate support --max-chunk-samples and --noise-scan."""
+    from zout.app import _build_parser, _validate
+
+    ap = _build_parser()
+    args = ap.parse_args(["--auto-noise", "-m", __file__, "--noise-scan", "sampled", "--max-chunk-samples", "480000"])
+    assert args.noise_scan == "sampled"
+    assert args.max_chunk_samples == 480000

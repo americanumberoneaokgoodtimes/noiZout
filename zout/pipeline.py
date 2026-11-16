@@ -9,7 +9,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .audio.io import get_audio_info, load_audio, peak_limit, resample, rms_db, save_audio
+from .audio.io import (
+    get_audio_info,
+    load_audio,
+    peak_limit,
+    resample,
+    resolve_writable_output_path,
+    rms_db,
+    save_audio,
+)
 from .audio.masking import noise_suppression_db
 from .config import JobConfig, ReferenceRole, SUPPORTED_AUDIO_EXTENSIONS
 from .engines.clean_engine import CleanVoiceEngine
@@ -46,6 +54,24 @@ def _cleanup_partial(path: Path | None) -> None:
                 pass
 
 
+def _append_warning(notes: dict, warning: str | None) -> None:
+    if not warning:
+        return
+    if notes.get("warning"):
+        notes["warning"] = f"{notes['warning']}; {warning}"
+    else:
+        notes["warning"] = warning
+
+
+def _format_fallback_warning(requested: Path, written: Path) -> str | None:
+    if written.suffix != requested.suffix:
+        return (
+            f"Requested '{requested.suffix}' format is not supported for writing; "
+            f"saved as WAV: {written.name}"
+        )
+    return None
+
+
 def run_streaming(
     cfg: JobConfig,
     progress: Progress | None = None,
@@ -65,6 +91,7 @@ def run_streaming(
         raise ValueError("reference and main files are required")
 
     out_path = Path(cfg.output or cfg.default_output())
+    resolved_out_path = resolve_writable_output_path(out_path)
     p = progress or (lambda *_: None)
     t0 = time.time()
 
@@ -107,6 +134,7 @@ def run_streaming(
                 start_sec=cfg.start_sec,
                 end_sec=cfg.end_sec,
                 cancel_event=cfg.cancel_event,
+                max_chunk_samples=cfg.max_chunk_samples,
             )
         else:
             path, notes = CleanVoiceEngine().run_streaming(
@@ -124,17 +152,20 @@ def run_streaming(
                 start_sec=cfg.start_sec,
                 end_sec=cfg.end_sec,
                 cancel_event=cfg.cancel_event,
+                max_chunk_samples=cfg.max_chunk_samples,
             )
     except InterruptedError:
-        _cleanup_partial(out_path)
+        _cleanup_partial(resolved_out_path)
         return None
     except Exception:
-        _cleanup_partial(out_path)
+        _cleanup_partial(resolved_out_path)
         raise
 
     if cfg.is_cancelled():
-        _cleanup_partial(out_path)
+        _cleanup_partial(resolved_out_path)
         return None
+
+    _append_warning(notes, _format_fallback_warning(out_path, path))
 
     in_rms = float(notes.get("in_rms", -120.0))
     out_rms = float(notes.get("out_rms", -120.0))
@@ -402,11 +433,7 @@ def run_job(
         p("Writing output", 0.97)
         out = peak_limit(out)
         path = save_audio(out_path, out, sr)
-        if path.suffix != out_path.suffix:
-            notes["warning"] = (
-                f"Requested '{out_path.suffix}' format is not supported for writing; "
-                f"saved as WAV: {path.name}"
-            )
+        _append_warning(notes, _format_fallback_warning(out_path, path))
         in_rms = rms_db(main)
         out_rms = rms_db(out)
         supp_db = noise_suppression_db(main, out)

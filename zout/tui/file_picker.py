@@ -121,7 +121,6 @@ def render(state: PickerState, title: str, typing_filter: bool, height: int, the
     rows = max(5, height - 12)
     start = max(0, min(state.index - rows // 2, len(state.entries) - rows))
     _cached_probe = None  # probe result for selected entry — reused in preview section below
-    _cached_env = ""
     for i in range(start, min(len(state.entries), start + rows)):
         e = state.entries[i]
         sel = i == state.index
@@ -140,14 +139,6 @@ def render(state: PickerState, title: str, typing_filter: bool, height: int, the
                 info = ""
             if ai:
                 info += f" | {ai.short()}"
-            if sel:
-                try:
-                    env = get_file_waveform_envelope(e.path, width=16)
-                    if env:
-                        _cached_env = env
-                        info += f" | {env}"
-                except Exception:
-                    pass
         mark = Text("> " if sel else "  ", style="bold yellow")
         name = Text.assemble(mark, (e.label, style))
         row_style = "reverse" if sel else ""
@@ -159,7 +150,7 @@ def render(state: PickerState, title: str, typing_filter: bool, height: int, the
     if state.entries and not state.entries[state.index].is_dir:
         sel_path = state.entries[state.index].path
         try:
-            env_str = _cached_env or get_file_waveform_envelope(sel_path, width=16)
+            env_str = get_file_waveform_envelope(sel_path, width=16)
             ai_sel = _cached_probe
             dur_str = f" ({ai_sel.short()})" if ai_sel else ""
             if env_str:

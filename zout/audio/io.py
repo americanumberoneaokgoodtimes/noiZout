@@ -473,13 +473,21 @@ def resample(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
     return soxr.resample(x, sr_in, sr_out, quality="VHQ").astype(np.float32)
 
 
+WRITABLE_EXTENSIONS = (".wav", ".flac", ".ogg")
+
+
+def resolve_writable_output_path(path: Path | str) -> Path:
+    """Resolve a destination path to a SoundFile-writable audio extension."""
+    p = Path(path)
+    if p.suffix.lower() not in WRITABLE_EXTENSIONS:
+        p = p.with_suffix(".wav")
+    return p
+
+
 def save_audio(path: Path, x: np.ndarray, sr: int) -> Path:
-    path = Path(path)
+    path = resolve_writable_output_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    ext = path.suffix.lower()
-    if ext not in (".wav", ".flac", ".ogg"):
-        path = path.with_suffix(".wav")
-    sf.write(str(path), x, sr, subtype="PCM_24" if path.suffix == ".wav" else None)
+    sf.write(str(path), x, sr, subtype="PCM_24" if path.suffix.lower() == ".wav" else None)
     return path
 
 

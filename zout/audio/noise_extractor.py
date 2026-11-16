@@ -8,7 +8,7 @@ from typing import Literal
 
 import numpy as np
 
-from .io import get_audio_info, iter_audio_chunks, load_audio, resample
+from .io import NATIVE_EXTENSIONS, get_audio_info, iter_audio_chunks, load_audio, resample
 
 Progress = Callable[[str, float], None]
 
@@ -419,6 +419,42 @@ def extract_noise_profile(
     )
 
 
+def _collect_block_candidates(
+    block: np.ndarray,
+    file_sr: int,
+    block_offset_sec: float,
+    chunk_sec: float,
+    candidates: list[dict],
+    top_cap: int,
+) -> None:
+    """Score noise windows in `block` and retain up to `top_cap` top candidates."""
+    chunk_samples = max(int(0.5 * file_sr), int(round(chunk_sec * file_sr)))
+    stride = max(int(0.5 * chunk_samples), 1)
+    hop_energy = max(1, int(0.025 * file_sr))
+    n_win = (len(block) - chunk_samples) // stride + 1
+    for w_idx in range(max(0, n_win)):
+        st = w_idx * stride
+        en = st + chunk_samples
+        seg = block[st:en]
+        scored = _score_noise_window(seg, file_sr, hop_energy)
+        if scored is None:
+            continue
+        score, rms_db = scored
+        cand = {
+            "start_sec": block_offset_sec + st / file_sr,
+            "end_sec": block_offset_sec + en / file_sr,
+            "rms_db": rms_db,
+            "score": score,
+            "seg": seg.copy(),
+        }
+        if len(candidates) < top_cap:
+            candidates.append(cand)
+        elif score > candidates[-1]["score"]:
+            candidates[-1] = cand
+        if len(candidates) == top_cap or w_idx == n_win - 1:
+            candidates.sort(key=lambda c: c["score"], reverse=True)
+
+
 def extract_noise_profile_from_file(
     path: Path | str,
     n_chunks: int = 6,
@@ -429,11 +465,13 @@ def extract_noise_profile_from_file(
     end_sec: float | None = None,
     progress: Progress | None = None,
     cancel_event=None,
+    scan_mode: Literal["auto", "sampled", "full"] = "auto",
 ) -> NoiseExtractionResult:
     """Memory-bounded file-backed noise profile extractor for recordings of any duration.
 
     For files <= 180s in the target range, loads the sliced audio directly.
-    For multi-hour recordings (> 180s), streams 30s blocks sequentially in < 35MB RAM.
+    For recordings > 180s, supports distributed sampled probing (`sampled` / `auto` > 600s)
+    or full sequential block streaming (`full`) in < 35MB RAM.
     """
     p = progress or (lambda *_: None)
     info = get_audio_info(path)
@@ -479,43 +517,80 @@ def extract_noise_profile_from_file(
     top_cap = max(60, n_chunks * 12)
     candidates: list[dict] = []
     file_sr = info.samplerate
-    block_offset_sec = t_start
-    p(f"Streaming energy scan across {eff_dur / 60:.1f} min recording...", 0.05)
 
-    for block, c_sr in iter_audio_chunks(
-        path, chunk_sec=30.0, start_sec=t_start, end_sec=t_end, mono=True, cancel_event=cancel_event
-    ):
-        file_sr = c_sr
-        chunk_samples = max(int(0.5 * file_sr), int(round(chunk_sec * file_sr)))
-        stride = max(int(0.5 * chunk_samples), 1)
-        hop_energy = max(1, int(0.025 * file_sr))
-        n_win = (len(block) - chunk_samples) // stride + 1
-        for w_idx in range(max(0, n_win)):
-            st = w_idx * stride
-            en = st + chunk_samples
-            seg = block[st:en]
-            scored = _score_noise_window(seg, file_sr, hop_energy)
-            if scored is None:
-                continue
-            score, rms_db = scored
-            cand = {
-                "start_sec": block_offset_sec + st / file_sr,
-                "end_sec": block_offset_sec + en / file_sr,
-                "rms_db": rms_db,
-                "score": score,
-                "seg": seg.copy(),
-            }
-            if len(candidates) < top_cap:
-                candidates.append(cand)
-            elif score > candidates[-1]["score"]:
-                candidates[-1] = cand
-            if len(candidates) == top_cap or w_idx == n_win - 1:
-                candidates.sort(key=lambda c: c["score"], reverse=True)
-        block_offset_sec += len(block) / file_sr
-        frac = min(1.0, (block_offset_sec - t_start) / max(1e-6, eff_dur))
-        p(f"Streaming energy scan ({frac * 100:.0f}%)...", 0.05 + frac * 0.55)
+    use_sampled = (scan_mode == "sampled") or (scan_mode == "auto" and eff_dur > 600.0)
 
-    candidates.sort(key=lambda c: c["score"], reverse=True)
+    def _run_sequential_scan() -> int:
+        nonlocal file_sr
+        block_offset_sec = t_start
+        p(f"Streaming energy scan across {eff_dur / 60:.1f} min recording...", 0.05)
+        for block, c_sr in iter_audio_chunks(
+            path, chunk_sec=30.0, start_sec=t_start, end_sec=t_end, mono=True, cancel_event=cancel_event
+        ):
+            file_sr = c_sr
+            _collect_block_candidates(block, file_sr, block_offset_sec, chunk_sec, candidates, top_cap)
+            block_offset_sec += len(block) / file_sr
+            frac = min(1.0, (block_offset_sec - t_start) / max(1e-6, eff_dur))
+            p(f"Streaming energy scan ({frac * 100:.0f}%)...", 0.05 + frac * 0.55)
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        return len(candidates)
+
+    def _run_sampled_scan() -> int:
+        nonlocal file_sr
+        is_native = Path(path).suffix.lower() in NATIVE_EXTENSIONS
+        if not is_native:
+            # Compressed formats (MP3/M4A/AAC) require O(N) packet demuxing for deep seeks;
+            # stream a single bounded window (e.g. 270s) in 1 ffmpeg pipe for ~2s extraction.
+            sample_span = min(eff_dur, max(240.0, n_chunks * 45.0))
+            s_end = min(t_end, t_start + sample_span)
+            block_offset_sec = t_start
+            p(f"Fast sampled energy scan ({sample_span / 60:.1f} min stream window)...", 0.05)
+            for block, c_sr in iter_audio_chunks(
+                path,
+                chunk_sec=30.0,
+                start_sec=t_start,
+                end_sec=s_end,
+                mono=True,
+                cancel_event=cancel_event,
+            ):
+                file_sr = c_sr
+                _collect_block_candidates(block, file_sr, block_offset_sec, chunk_sec, candidates, top_cap)
+                block_offset_sec += len(block) / file_sr
+                frac = min(1.0, (block_offset_sec - t_start) / max(1e-6, sample_span))
+                p(f"Fast sampled energy scan ({frac * 100:.0f}%)...", 0.05 + frac * 0.55)
+            candidates.sort(key=lambda c: c["score"], reverse=True)
+            return len(candidates)
+
+        probe_sec = min(15.0, max(10.0, chunk_sec * 3.0))
+        probe_count = min(24, max(8, n_chunks * 3))
+        if probe_count * probe_sec >= eff_dur * 0.85:
+            return _run_sequential_scan()
+        span = max(0.0, eff_dur - probe_sec)
+        starts = [t_start + (span * i / max(1, probe_count - 1)) for i in range(probe_count)]
+        p(f"Sampled energy scan ({probe_count} distributed windows across {eff_dur / 60:.1f} min)...", 0.05)
+        for idx, p_start in enumerate(starts):
+            p_end = min(t_end, p_start + probe_sec)
+            block_offset_sec = p_start
+            for block, c_sr in iter_audio_chunks(
+                path,
+                chunk_sec=30.0,
+                start_sec=p_start,
+                end_sec=p_end,
+                mono=True,
+                cancel_event=cancel_event,
+            ):
+                file_sr = c_sr
+                _collect_block_candidates(block, file_sr, block_offset_sec, chunk_sec, candidates, top_cap)
+                block_offset_sec += len(block) / file_sr
+            frac = (idx + 1) / probe_count
+            p(f"Sampled energy scan ({idx + 1}/{probe_count} windows)...", 0.05 + frac * 0.55)
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        return len(candidates)
+
+    if use_sampled:
+        _run_sampled_scan()
+    else:
+        _run_sequential_scan()
 
     def _vad_sub(lo: float, hi: float) -> Progress:
         def _inner(msg: str, f: float) -> None:
@@ -535,6 +610,25 @@ def extract_noise_profile_from_file(
         get_timestamps=get_timestamps,
         cancel_event=cancel_event,
     )
+
+    # If auto-sampled scan yielded fewer than half the requested chunks, fall back to full sequential scan
+    if use_sampled and scan_mode == "auto" and len(selected) < max(1, n_chunks // 2):
+        p("Expanding to full sequential scan for denser speech recording...", 0.55)
+        candidates.clear()
+        _run_sequential_scan()
+        selected = _vad_filter_candidates(
+            candidates,
+            audio_resolver=lambda c: c["seg"],
+            sr=file_sr,
+            target_count=n_chunks,
+            max_vad_prob=max_vad,
+            mean_vad_prob=mean_vad,
+            min_gap_sec=min_gap_sec,
+            progress=_vad_sub(0.65, 0.80),
+            vad_model=vad_model,
+            get_timestamps=get_timestamps,
+            cancel_event=cancel_event,
+        )
 
     if len(selected) == 0 and mode != "deep":
         p("Retrying with relaxed sensitivity threshold...", 0.80)

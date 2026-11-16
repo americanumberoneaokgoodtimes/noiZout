@@ -39,6 +39,7 @@ class JobConfig:
     cancel_event: threading.Event | None = None
     batch_dir: Path | None = None
     out_dir: Path | None = None
+    max_chunk_samples: int = 240_000
 
     # Pass allow_invalid_range=True to suppress the start_sec < end_sec check so
     # run_job can receive the config and emit the validation error at pipeline level.
@@ -87,6 +88,9 @@ class JobConfig:
             raise ValueError(
                 f"overlap_duration ({self.overlap_duration}) must be strictly less than chunk_duration ({self.chunk_duration})"
             )
+        if int(self.max_chunk_samples) < 4096:
+            raise ValueError(f"max_chunk_samples must be >= 4096: {self.max_chunk_samples}")
+        self.max_chunk_samples = int(self.max_chunk_samples)
 
     def use_polish(self) -> bool:
         return self.polish if self.polish is not None else True

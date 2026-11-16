@@ -15,12 +15,29 @@ from ..audio.io import (
     local_peak_limit,
     open_ffmpeg_pcm_stream,
     read_pcm_frames,
+    resolve_writable_output_path,
 )
 from ..audio.masking import N_FFT, _istft, _stft, apply_adaptive_mask
 
 Progress = Callable[[str, float], None]
 
 MAX_SAMPLES_PER_CHUNK: int = 240_000  # Caps peak memory < 75MB (and < 150MB) across all sample rates (e.g. 5s @ 48kHz, 2.5s @ 96kHz, 15s @ 16kHz)
+
+
+def effective_streaming_window(
+    chunk_sec: float,
+    overlap_sec: float,
+    sr: int,
+    max_samples: int = MAX_SAMPLES_PER_CHUNK,
+) -> tuple[float, float, bool]:
+    """Compute effective (chunk_sec, overlap_sec, was_capped) bounded by max_samples."""
+    safe_sr = max(1, int(sr))
+    safe_cap = max(4096, int(max_samples))
+    max_chunk_sec = float(safe_cap) / float(safe_sr)
+    eff_chunk_sec = min(float(chunk_sec), max_chunk_sec)
+    eff_overlap_sec = min(float(overlap_sec), eff_chunk_sec / 4.0)
+    was_capped = (eff_chunk_sec < float(chunk_sec) - 1e-6) or (eff_overlap_sec < float(overlap_sec) - 1e-6)
+    return eff_chunk_sec, eff_overlap_sec, was_capped
 
 
 def _ensure_min_ref_length(ref: np.ndarray, min_len: int = N_FFT) -> np.ndarray:
@@ -99,10 +116,11 @@ def _stream_disk_to_disk(
     end_sec: float | None = None,
     progress: Progress | None = None,
     cancel_event: threading.Event | None = None,
-) -> dict[str, float]:
-    """Streams audio blocks disk-to-disk with 2-second raised-cosine overlap-add.
+    max_chunk_samples: int = MAX_SAMPLES_PER_CHUNK,
+) -> dict[str, float | str]:
+    """Streams audio blocks disk-to-disk with raised-cosine overlap-add.
 
-    Keeps peak memory bounded (< 85MB peak RAM) regardless of file duration.
+    Keeps peak memory bounded (< 75MB default) regardless of file duration.
     """
     p = progress or (lambda *_: None)
     if cancel_event is not None and cancel_event.is_set():
@@ -128,15 +146,13 @@ def _stream_disk_to_disk(
     if target_frames <= 0:
         raise ValueError("Sliced duration must be positive")
 
-    out_p = Path(out_path)
-    if out_p.suffix.lower() not in (".wav", ".flac", ".ogg"):
-        out_p = out_p.with_suffix(".wav")
+    out_p = resolve_writable_output_path(out_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
     subtype = "PCM_24" if out_p.suffix.lower() == ".wav" else None
 
-    max_chunk_sec = float(MAX_SAMPLES_PER_CHUNK) / float(file_sr)
-    eff_chunk_sec = min(chunk_sec, max_chunk_sec)
-    eff_overlap_sec = min(overlap_sec, eff_chunk_sec / 4.0)
+    eff_chunk_sec, eff_overlap_sec, _ = effective_streaming_window(
+        chunk_sec, overlap_sec, file_sr, max_samples=max_chunk_samples
+    )
     N_chunk = max(1024, int(round(eff_chunk_sec * file_sr)))
     N_overlap = int(round(eff_overlap_sec * file_sr)) if eff_overlap_sec > 0 else 0
     if N_overlap >= N_chunk:
@@ -305,6 +321,7 @@ def _stream_disk_to_disk(
         "out_rms": out_rms,
         "suppression_db": suppression_db,
         "samples_written": total_out_samples,
+        "output_path": str(out_p),
     }
 
 
@@ -431,6 +448,7 @@ class NoisyAcousticEngine:
         start_sec: float | None = None,
         end_sec: float | None = None,
         cancel_event: threading.Event | None = None,
+        max_chunk_samples: int = MAX_SAMPLES_PER_CHUNK,
     ) -> tuple[Path, dict]:
         try:
             import noisereduce as nr
@@ -525,6 +543,8 @@ class NoisyAcousticEngine:
             end_sec=end_sec,
             progress=_chunk_progress,
             cancel_event=cancel_event,
+            max_chunk_samples=max_chunk_samples,
         )
+        resolved_out = Path(stats.pop("output_path", resolve_writable_output_path(out_path)))
         stats.update(_polish_notes)
-        return Path(out_path), stats
+        return resolved_out, stats
